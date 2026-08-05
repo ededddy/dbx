@@ -1,7 +1,7 @@
 use crate::query::MAX_ROWS;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, ObjectStatistics, QueryResult,
+    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, ObjectStatistics, QueryMessage, QueryResult,
     SpatialColumnBuilder, TableInfo, TriggerInfo,
 };
 use futures::{FutureExt, TryStreamExt};
@@ -486,15 +486,41 @@ where
     (output, messages)
 }
 
+/// Map captured tiberius INFO-token texts to generic query messages. Tiberius
+/// exposes only the message text in its tracing event, so severity is always
+/// `INFO` and no code/detail/hint is available.
+fn sqlserver_query_messages(messages: &[String]) -> Vec<QueryMessage> {
+    messages
+        .iter()
+        .map(|message| QueryMessage {
+            severity: "INFO".to_string(),
+            message: message.clone(),
+            code: None,
+            detail: None,
+            hint: None,
+        })
+        .collect()
+}
+
 fn query_result_with_server_messages(result: QueryResult, messages: Vec<String>) -> QueryResult {
     query_result_with_server_messages_metadata(result, messages).result
 }
 
 fn query_result_with_server_messages_metadata(mut result: QueryResult, messages: Vec<String>) -> SqlServerBatchResult {
-    if messages.is_empty() || !result.columns.is_empty() || !result.rows.is_empty() {
+    if messages.is_empty() {
+        return SqlServerBatchResult { result, server_message: false };
+    }
+    if !result.columns.is_empty() || !result.rows.is_empty() {
+        // Tabular results keep their shape and additionally carry the
+        // messages; only the empty-result synthesis below leaves
+        // `messages` empty so consumers do not render the same text twice.
+        result.messages = sqlserver_query_messages(&messages);
         return SqlServerBatchResult { result, server_message: false };
     }
 
+    // Empty results synthesize the legacy single-"Message"-column grid; the
+    // text lives only there, so `messages` stays empty to avoid consumers
+    // rendering the same text twice.
     result.columns = vec![SQLSERVER_MESSAGE_COLUMN.to_string()];
     result.column_types = vec!["nvarchar".to_string()];
     result.rows = messages.into_iter().map(|message| vec![serde_json::Value::String(message)]).collect();
@@ -520,6 +546,7 @@ fn server_messages_query_result(messages: Vec<String>, start: Instant) -> Option
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         },
         messages,
     ))
@@ -585,6 +612,7 @@ async fn collect_first_result_limited(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -1283,6 +1311,7 @@ fn push_sqlserver_result_set(results: &mut Vec<QueryResult>, result: Option<SqlS
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         });
     }
 }
@@ -1340,6 +1369,7 @@ fn push_sqlserver_ordered_events(
                         session_id: None,
                         has_more: false,
                         elasticsearch_raw_body: None,
+                        messages: Vec::new(),
                     },
                     server_message: false,
                 });
@@ -2669,6 +2699,7 @@ pub async fn execute_query_with_max_rows(
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             },
             messages,
         ))
@@ -2713,6 +2744,7 @@ pub(crate) async fn execute_batch_with_max_rows_metadata(
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             },
             messages,
         )]);
@@ -2797,6 +2829,7 @@ pub(crate) async fn execute_simple_batch_with_max_rows_metadata(
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             },
             server_message: false,
         });
@@ -3066,16 +3099,17 @@ mod tests {
         is_sqlserver_spatial_column, is_sqlserver_variant_column, push_sqlserver_ordered_events,
         query_result_with_server_messages, query_result_with_server_messages_metadata, requires_simple_query_batch,
         restore_sqlserver_legacy_probe_output_names, restore_sqlserver_spatial_column_types,
-        sqlserver_batch_can_use_execute, sqlserver_bulk_token_row, sqlserver_cell_to_json, sqlserver_columns_sql,
-        sqlserver_completion_assistant_sql, sqlserver_dml_output_returns_rows, sqlserver_done_trace_event,
-        sqlserver_filter_definition_error, sqlserver_hidden_schema_names, sqlserver_indexes_sql,
-        sqlserver_legacy_indexes_sql, sqlserver_legacy_probe, sqlserver_legacy_probe_with_nonce,
-        sqlserver_list_objects_sql, sqlserver_list_schemas_sql, sqlserver_list_tables_sql,
-        sqlserver_probe_explicit_alias, sqlserver_schema_name_predicate, sqlserver_spatial_marker,
-        sqlserver_supports_session_database_switch, sqlserver_table_comment_sql, sqlserver_triggers_sql,
-        sqlserver_visible_object_predicate, strip_dbx_sqlserver_row_number_column, SqlServerDescribedColumn,
-        SqlServerProbeOutputNameOverride, SqlServerResultSet, SqlServerSpatialColumn, SqlServerTdsEvent,
-        SQLSERVER_COMPLETION_CONTEXT_SQL, SQLSERVER_RESULT_TYPE_PROBE_SQL,
+        server_messages_query_result, sqlserver_batch_can_use_execute, sqlserver_bulk_token_row,
+        sqlserver_cell_to_json, sqlserver_columns_sql, sqlserver_completion_assistant_sql,
+        sqlserver_dml_output_returns_rows, sqlserver_done_trace_event, sqlserver_filter_definition_error,
+        sqlserver_hidden_schema_names, sqlserver_indexes_sql, sqlserver_legacy_indexes_sql, sqlserver_legacy_probe,
+        sqlserver_legacy_probe_with_nonce, sqlserver_list_objects_sql, sqlserver_list_schemas_sql,
+        sqlserver_list_tables_sql, sqlserver_probe_explicit_alias, sqlserver_query_messages,
+        sqlserver_schema_name_predicate, sqlserver_spatial_marker, sqlserver_supports_session_database_switch,
+        sqlserver_table_comment_sql, sqlserver_triggers_sql, sqlserver_visible_object_predicate,
+        strip_dbx_sqlserver_row_number_column, SqlServerDescribedColumn, SqlServerProbeOutputNameOverride,
+        SqlServerResultSet, SqlServerSpatialColumn, SqlServerTdsEvent, SQLSERVER_COMPLETION_CONTEXT_SQL,
+        SQLSERVER_RESULT_TYPE_PROBE_SQL,
     };
     use crate::types::{
         CompletionAssistantMatchMode, CompletionAssistantObjectKind, CompletionAssistantRequest, QueryResult,
@@ -3120,10 +3154,15 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
         let result = query_result_with_server_messages(empty, vec!["DBCC execution completed".to_string()]);
         assert_eq!(result.columns, vec!["Message"]);
+        assert_eq!(result.column_types, vec!["nvarchar"]);
         assert_eq!(result.rows, vec![vec![serde_json::json!("DBCC execution completed")]]);
+        // The synthesized grid already carries the text; `messages` stays
+        // empty so consumers do not render the same text twice.
+        assert!(result.messages.is_empty());
 
         let message = query_result_with_server_messages_metadata(
             QueryResult {
@@ -3139,6 +3178,7 @@ mod tests {
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             },
             vec!["PRINT output".to_string()],
         );
@@ -3157,11 +3197,16 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
         let result = query_result_with_server_messages_metadata(select, vec!["informational".to_string()]);
         assert!(!result.server_message);
         assert_eq!(result.result.columns, vec!["id"]);
         assert_eq!(result.result.rows, vec![vec![serde_json::json!(1)]]);
+        // Non-empty results keep their shape but still carry the server messages.
+        assert_eq!(result.result.messages.len(), 1);
+        assert_eq!(result.result.messages[0].severity, "INFO");
+        assert_eq!(result.result.messages[0].message, "informational");
     }
 
     #[test]
@@ -3302,6 +3347,36 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].result.columns, vec!["selected"]);
         assert_eq!(results[1].result.affected_rows, 2);
+    }
+
+    #[test]
+    fn sqlserver_query_messages_map_info_severity() {
+        let messages = sqlserver_query_messages(&["first".to_string(), "second".to_string()]);
+        assert_eq!(messages.len(), 2);
+        for (message, expected) in messages.iter().zip(["first", "second"]) {
+            assert_eq!(message.severity, "INFO");
+            assert_eq!(message.message, expected);
+            assert!(message.code.is_none());
+            assert!(message.detail.is_none());
+            assert!(message.hint.is_none());
+        }
+
+        assert!(sqlserver_query_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn sqlserver_server_messages_query_result_synthesizes_grid() {
+        assert!(server_messages_query_result(vec![], Instant::now()).is_none());
+
+        let result = server_messages_query_result(vec!["print output".to_string()], Instant::now())
+            .expect("non-empty messages yield a result");
+        assert!(result.server_message);
+        assert_eq!(result.result.columns, vec!["Message"]);
+        assert_eq!(result.result.column_types, vec!["nvarchar"]);
+        assert_eq!(result.result.rows, vec![vec![serde_json::json!("print output")]]);
+        // The synthesized grid already carries the text; `messages` stays
+        // empty so consumers do not render the same text twice.
+        assert!(result.result.messages.is_empty());
     }
 
     #[test]
@@ -3822,6 +3897,7 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
         .unwrap();
 
@@ -4164,6 +4240,7 @@ mod tests {
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         strip_dbx_sqlserver_row_number_column(&mut result, sql);

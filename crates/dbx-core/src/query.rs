@@ -2432,6 +2432,7 @@ fn error_query_result(message: String) -> db::QueryResult {
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -2449,6 +2450,7 @@ fn empty_query_result(execution_time_ms: u128) -> db::QueryResult {
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -2679,6 +2681,7 @@ pub async fn execute_statements(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -3178,6 +3181,7 @@ async fn exec_tx_pg_inner(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         }),
         (Err(e), Ok(_)) => Err(e),
         (Ok(_), Err(reset_err)) => Err(reset_err),
@@ -3270,6 +3274,7 @@ async fn exec_tx_mysql_inner(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -3336,6 +3341,7 @@ async fn exec_tx_sqlite_inner(
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         })
     })
@@ -3410,6 +3416,7 @@ async fn exec_tx_explicit_inner(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -3477,6 +3484,7 @@ async fn exec_tx_none_inner(
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -3943,6 +3951,7 @@ async fn execute_manual_txn_postgres_statement(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
     }
 }
@@ -3985,6 +3994,7 @@ async fn execute_manual_txn_mysql_statement(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
     } else {
         let result = conn.query_iter(sql).await.map_err(|e| format!("Query failed: {e}"))?;
@@ -4003,6 +4013,7 @@ async fn execute_manual_txn_mysql_statement(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
     }
 }
@@ -4038,6 +4049,7 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -4065,6 +4077,7 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 
@@ -4853,6 +4866,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
         let mut executor = FakeMysqlBatchExecutor {
             outcomes: std::collections::VecDeque::from([
@@ -5368,6 +5382,7 @@ for line in sys.stdin:
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         })
         .await;
@@ -5392,6 +5407,7 @@ for line in sys.stdin:
                 session_id: None,
                 has_more: false,
                 elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         })
         .await;
@@ -6071,6 +6087,7 @@ for line in sys.stdin:
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         };
 
         let normalized = normalize_query_result_for_js(result);

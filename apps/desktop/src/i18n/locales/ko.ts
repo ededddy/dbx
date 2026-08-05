@@ -912,6 +912,7 @@ export default withEnglishFallback({
     objects: "객체",
     users: "사용자 및 권한",
     executionSummary: "요약",
+    messages: "메시지",
     tooltipTitle: "제목:",
     tooltipFilePath: "파일 경로:",
     tooltipConnection: "연결:",
@@ -1007,6 +1008,10 @@ export default withEnglishFallback({
       skipped: "실행 안 됨",
       cancelled: "취소됨",
     },
+  },
+  queryMessages: {
+    empty: "메시지 없음",
+    code: "코드: {code}",
   },
   chart: {
     title: "차트",

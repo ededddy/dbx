@@ -993,6 +993,7 @@ export default withEnglishFallback({
     objects: "オブジェクト",
     users: "ユーザーと権限",
     executionSummary: "サマリー",
+    messages: "メッセージ",
     tooltipTitle: "タイトル:",
     tooltipFilePath: "ファイルパス:",
     tooltipConnection: "接続:",
@@ -1060,6 +1061,10 @@ export default withEnglishFallback({
       skipped: "未実行",
       cancelled: "キャンセル済み",
     },
+  },
+  queryMessages: {
+    empty: "メッセージなし",
+    code: "コード: {code}",
   },
   chart: {
     title: "グラフ",

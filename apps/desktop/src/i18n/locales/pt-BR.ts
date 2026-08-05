@@ -975,6 +975,7 @@ export default withEnglishFallback({
     objects: "Objetos",
     users: "Usuários e Privilégios",
     executionSummary: "Resumo",
+    messages: "Mensagens",
     tooltipTitle: "Título:",
     tooltipFilePath: "Caminho do arquivo:",
     tooltipConnection: "Conexão:",
@@ -1040,6 +1041,10 @@ export default withEnglishFallback({
       skipped: "Não executada",
       cancelled: "Cancelada",
     },
+  },
+  queryMessages: {
+    empty: "Nenhuma mensagem",
+    code: "Código: {code}",
   },
   chart: {
     title: "Gráfico",

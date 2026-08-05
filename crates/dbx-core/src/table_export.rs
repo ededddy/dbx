@@ -427,6 +427,7 @@ async fn fetch_table_export_batch(
             session_id: None,
             has_more: false,
             elasticsearch_raw_body: None,
+            messages: Vec::new(),
         });
     }
 

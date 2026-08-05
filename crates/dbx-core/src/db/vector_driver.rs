@@ -806,6 +806,7 @@ fn json_to_query_result(status: u16, body: Value, start: Instant) -> QueryResult
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -839,6 +840,7 @@ fn values_to_query_result(items: Vec<Value>, start: Instant) -> QueryResult {
         session_id: None,
         has_more: false,
         elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 

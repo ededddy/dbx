@@ -285,6 +285,42 @@ impl SpatialColumnBuilder {
     }
 }
 
+/// A message emitted by the database server while executing a statement:
+/// PostgreSQL `RAISE NOTICE`/`WARNING`, MySQL warnings and OK-packet info
+/// strings, SQL Server `PRINT`/`RAISERROR` info messages, and similar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryMessage {
+    /// Severity/level as reported by the server (e.g. `NOTICE`, `WARNING`,
+    /// `INFO`, `ERROR`, MySQL's `Note`/`Warning`).
+    pub severity: String,
+    pub message: String,
+    /// Server error/condition code (PostgreSQL SQLSTATE, MySQL error code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl QueryMessage {
+    /// One-line text rendering shared by the CLI, MCP, and agent tool output:
+    /// `SEVERITY: message` plus inline `(code: …, detail: …, hint: …)` extras.
+    pub fn format_line(&self) -> String {
+        let mut line = format!("{}: {}", self.severity.to_uppercase(), self.message);
+        let extras = [
+            self.code.as_ref().map(|value| format!("code: {value}")),
+            self.detail.as_ref().map(|value| format!("detail: {value}")),
+            self.hint.as_ref().map(|value| format!("hint: {value}")),
+        ];
+        let extras: Vec<_> = extras.into_iter().flatten().collect();
+        if !extras.is_empty() {
+            line.push_str(&format!(" ({})", extras.join(", ")));
+        }
+        line
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -321,6 +357,11 @@ pub struct QueryResult {
     /// between the tabular view and the original JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elasticsearch_raw_body: Option<String>,
+    /// Messages emitted by the database server while executing the statement
+    /// (notices, warnings, info messages). Empty for drivers that do not
+    /// capture server messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<QueryMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
