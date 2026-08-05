@@ -494,7 +494,87 @@ pub struct OwnerInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectInfo, ObjectSourceKind, SpatialColumn, SpatialColumnBuilder};
+    use super::{ObjectInfo, ObjectSourceKind, QueryMessage, SpatialColumn, SpatialColumnBuilder};
+
+    #[test]
+    fn query_message_format_line_uppercases_severity() {
+        let message = QueryMessage {
+            severity: "notice".to_string(),
+            message: "hello world".to_string(),
+            code: None,
+            detail: None,
+            hint: None,
+        };
+
+        assert_eq!(message.format_line(), "NOTICE: hello world");
+    }
+
+    #[test]
+    fn query_message_format_line_appends_code_detail_hint_extras() {
+        let message = QueryMessage {
+            severity: "WARNING".to_string(),
+            message: "careful".to_string(),
+            code: Some("01000".to_string()),
+            detail: Some("column truncated".to_string()),
+            hint: Some("widen the column".to_string()),
+        };
+
+        assert_eq!(
+            message.format_line(),
+            "WARNING: careful (code: 01000, detail: column truncated, hint: widen the column)"
+        );
+    }
+
+    #[test]
+    fn query_message_format_line_skips_missing_extras() {
+        let message = QueryMessage {
+            severity: "INFO".to_string(),
+            message: "Records: 3".to_string(),
+            code: None,
+            detail: None,
+            hint: Some("use a table".to_string()),
+        };
+
+        assert_eq!(message.format_line(), "INFO: Records: 3 (hint: use a table)");
+    }
+
+    #[test]
+    fn query_message_omits_empty_optional_fields_in_json() {
+        let minimal = QueryMessage {
+            severity: "NOTICE".to_string(),
+            message: "hello".to_string(),
+            code: None,
+            detail: None,
+            hint: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&minimal).unwrap(),
+            serde_json::json!({ "severity": "NOTICE", "message": "hello" })
+        );
+
+        let full = QueryMessage {
+            severity: "NOTICE".to_string(),
+            message: "hello".to_string(),
+            code: Some("00000".to_string()),
+            detail: Some("d".to_string()),
+            hint: Some("h".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::json!({ "severity": "NOTICE", "message": "hello", "code": "00000", "detail": "d", "hint": "h" })
+        );
+    }
+
+    #[test]
+    fn query_message_deserializes_without_optional_fields() {
+        let message: QueryMessage = serde_json::from_str(r#"{"severity":"Note","message":"Records: 1"}"#).unwrap();
+
+        assert_eq!(message.severity, "Note");
+        assert_eq!(message.message, "Records: 1");
+        assert_eq!(message.code, None);
+        assert_eq!(message.detail, None);
+        assert_eq!(message.hint, None);
+    }
 
     #[test]
     fn list_objects_payload_preserves_optional_validity() {
