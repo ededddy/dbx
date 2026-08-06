@@ -11,6 +11,7 @@ import type { SqlSemanticBuildOptions, SqlSemanticSpan } from "@/lib/sql/semanti
 import { DEFAULT_SQL_SNIPPETS, MANTICORESEARCH_SQL_SNIPPETS, resolveSqlSnippetBodyForDatabase } from "@/lib/sql/sqlSnippetTemplates";
 import { requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
 import { containsHan, orderedSubsequenceSpan, pinyinFirstLetters } from "@/lib/common/pinyin";
+import { quoteTableIdentifier } from "@/lib/table/tableSelectSql";
 
 export { DEFAULT_SQL_SNIPPETS, resolveSqlSnippetBodyForDatabase } from "@/lib/sql/sqlSnippetTemplates";
 
@@ -2861,6 +2862,14 @@ export function quoteSqlIdentifier(identifier: string, dialect?: "mysql" | "post
 
 const POSTGRES_IDENTIFIER_KEYWORDS = new Set(SQL_KEYWORDS.map((keyword) => keyword.toLowerCase()));
 
+function quoteSelectStarColumnIdentifier(identifier: string, dialect?: "mysql" | "postgres" | "sqlserver", databaseType?: DatabaseType): string {
+  if (!requiresPostgresIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
+  if (databaseType) return quoteTableIdentifier(databaseType, identifier);
+  if (dialect === "mysql") return `\`${identifier.replaceAll("`", "``")}\``;
+  if (dialect === "sqlserver") return `[${identifier.replaceAll("]", "]]")}]`;
+  return quoteSqlIdentifier(identifier, dialect);
+}
+
 function buildTableItems(
   context: Pick<SqlCompletionContext, "prefix" | "qualifier">,
   tables: SqlCompletionTable[],
@@ -3167,16 +3176,38 @@ function buildPreferredKeywordItems(prefix: string, keywords: string[], keywordC
     }));
 }
 
-function buildStarExpansionItem(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>, t?: SqlCompletionTranslations, dialect?: "mysql" | "postgres" | "sqlserver"): SqlCompletionItem | null {
+function selectStarExpansionColumns(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>): SqlCompletionColumn[] {
   const columns = context.qualifier ? referencedTablesForSelectAllColumns(context).flatMap((ref) => columnsForSelectAllReferencedTable(ref, columnsByTable)) : [...columnsByTable.values()].flat();
-  const uniqueColumns = uniqueColumnsByName(columns);
-  if (uniqueColumns.length === 0) return null;
+  return uniqueColumnsByName(columns);
+}
+
+export function selectStarResultColumnsMatch(options: { currentSql: string; targetFrom: number; targetTo: number; statementSql: string; sourceStatement?: string; sourceFrom?: number; sourceTo?: number }): boolean {
+  if (!options.sourceStatement) return false;
+  const hasSourceFrom = typeof options.sourceFrom === "number";
+  const hasSourceTo = typeof options.sourceTo === "number";
+  if (hasSourceFrom !== hasSourceTo) return false;
+  if (!hasSourceFrom || !hasSourceTo) return options.statementSql === options.sourceStatement;
+  // 词边界检查：已执行语句可能是当前内容的真前缀（如 `FROM users` → `FROM users_backup`），
+  // 此时 slice 仍与 sourceStatement 相等，会用旧表列回退到新表。要求 sourceTo 落在标识符边界。
+  const sourceToAtBoundary = !/[\w$]/.test(options.currentSql[options.sourceTo!] ?? "");
+  return options.targetFrom >= options.sourceFrom! && options.targetTo <= options.sourceTo! && sourceToAtBoundary && options.currentSql.slice(options.sourceFrom, options.sourceTo) === options.sourceStatement;
+}
+
+export function buildSelectStarExpansion(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>, dialect?: "mysql" | "postgres" | "sqlserver", qualifierSql = context.qualifier, databaseType?: DatabaseType): string | null {
+  const columns = selectStarExpansionColumns(context, columnsByTable);
+  if (columns.length === 0) return null;
   // `alias.*` replaces only the `*`, so the first column must continue the already typed `alias.`.
-  const expansion = context.qualifier ? buildSelectAllColumnExpansion(uniqueColumns, context.qualifier, true, dialect) : uniqueColumns.map((column) => quoteSqlIdentifier(column.name, dialect)).join(", ");
+  return qualifierSql ? buildSelectAllColumnExpansion(columns, qualifierSql, true, dialect, databaseType) : columns.map((column) => quoteSelectStarColumnIdentifier(column.name, dialect, databaseType)).join(", ");
+}
+
+function buildStarExpansionItem(context: SqlCompletionContext, columnsByTable: Map<string, SqlCompletionColumn[]>, t?: SqlCompletionTranslations, dialect?: "mysql" | "postgres" | "sqlserver"): SqlCompletionItem | null {
+  const expansion = buildSelectStarExpansion(context, columnsByTable, dialect);
+  if (!expansion) return null;
+  const columnCount = selectStarExpansionColumns(context, columnsByTable).length;
   return {
     label: "* → columns",
     type: "snippet" as const,
-    detail: `${(t?.starExpansionColumns ?? "{count} columns").replace("{count}", String(uniqueColumns.length))}: ${expansion.length > 60 ? expansion.slice(0, 57) + "..." : expansion}`,
+    detail: `${(t?.starExpansionColumns ?? "{count} columns").replace("{count}", String(columnCount))}: ${expansion.length > 60 ? expansion.slice(0, 57) + "..." : expansion}`,
     apply: expansion,
     boost: 1900,
   };
@@ -3248,10 +3279,10 @@ function referencedTablesForSelectAllColumns(context: SqlCompletionContext): Sql
   return context.referencedTables.filter((table) => referencedTableMatchesColumnQualifier(table, qualifier, qualifierLower, qualifiedTarget));
 }
 
-function buildSelectAllColumnExpansion(columns: SqlCompletionColumn[], qualifier: string | undefined, qualifierAlreadyTyped: boolean, dialect?: "mysql" | "postgres" | "sqlserver"): string {
+function buildSelectAllColumnExpansion(columns: SqlCompletionColumn[], qualifier: string | undefined, qualifierAlreadyTyped: boolean, dialect?: "mysql" | "postgres" | "sqlserver", databaseType?: DatabaseType): string {
   return columns
     .map((column, index) => {
-      const columnName = quoteSqlIdentifier(column.name, dialect);
+      const columnName = quoteSelectStarColumnIdentifier(column.name, dialect, databaseType);
       if (!qualifier || (qualifierAlreadyTyped && index === 0)) return columnName;
       return `${qualifier}.${columnName}`;
     })

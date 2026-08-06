@@ -21,19 +21,19 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ regexMaxMatchCount: Number.POSITIVE_INFINITY }).regexMaxMatchCount).toBe(1000);
     expect(normalizeEditorSettings({ regexMaxMatchCount: Number.NaN }).regexMaxMatchCount).toBe(1000);
   });
-  it("uses aligned comments by default and preserves legacy comment visibility", () => {
-    expect(normalizeEditorSettings({}).sidebarObjectInfoMode).toBe("comment-aligned");
+  it("uses inline comments by default and preserves legacy comment visibility", () => {
+    expect(normalizeEditorSettings({}).sidebarObjectInfoMode).toBe("comment-inline");
     expect(normalizeEditorSettings({ sidebarObjectInfoMode: "comment-aligned" }).sidebarObjectInfoMode).toBe("comment-aligned");
     expect(normalizeEditorSettings({ sidebarObjectInfoMode: "comment-inline" }).sidebarObjectInfoMode).toBe("comment-inline");
     expect(normalizeEditorSettings({ sidebarObjectInfoMode: "comment-right" }).sidebarObjectInfoMode).toBe("comment-right");
     expect(normalizeEditorSettings({ sidebarObjectInfoMode: "size" }).sidebarObjectInfoMode).toBe("size");
     expect(normalizeEditorSettings({ sidebarTableCommentLayout: "aligned" } as any).sidebarObjectInfoMode).toBe("comment-aligned");
     expect(normalizeEditorSettings({ sidebarTableCommentLayout: "hidden" } as any).sidebarObjectInfoMode).toBe("hidden");
-    expect(normalizeEditorSettings({ sidebarHideTableComments: false } as any).sidebarObjectInfoMode).toBe("comment-aligned");
+    expect(normalizeEditorSettings({ sidebarHideTableComments: false } as any).sidebarObjectInfoMode).toBe("comment-inline");
     expect(normalizeEditorSettings({ sidebarHideTableComments: true } as any).sidebarObjectInfoMode).toBe("hidden");
     expect(normalizeEditorSettings({ sidebarHideTableComments: true, sidebarShowDatabaseSizes: true } as any).sidebarObjectInfoMode).toBe("hidden");
     expect(normalizeEditorSettings({ sidebarShowDatabaseSizes: true } as any).sidebarObjectInfoMode).toBe("size");
-    expect(normalizeEditorSettings({ sidebarObjectInfoMode: "invalid" } as any).sidebarObjectInfoMode).toBe("comment-aligned");
+    expect(normalizeEditorSettings({ sidebarObjectInfoMode: "invalid" } as any).sidebarObjectInfoMode).toBe("comment-inline");
   });
 
   it("defaults SQL execution to the current statement and migrates legacy execute-all settings", () => {
@@ -131,11 +131,13 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ dataGridSearchMode: "invalid" as any }).dataGridSearchMode).toBe("filter");
   });
 
-  it("defaults the global data grid copy extractor and preserves valid choices", () => {
-    expect(normalizeEditorSettings({}).dataGridCopyExtractor).toBe("tsv");
+  it("defaults the global data grid copy preference and preserves valid choices", () => {
+    expect(normalizeEditorSettings({}).dataGridCopyExtractor).toBe("smart");
+    expect(normalizeEditorSettings({ dataGridCopyExtractor: "smart" }).dataGridCopyExtractor).toBe("smart");
+    expect(normalizeEditorSettings({ dataGridCopyExtractor: "tsv" }).dataGridCopyExtractor).toBe("tsv");
     expect(normalizeEditorSettings({ dataGridCopyExtractor: "sql-updates" }).dataGridCopyExtractor).toBe("sql-updates");
     expect(normalizeEditorSettings({ dataGridCopyExtractor: "markdown" }).dataGridCopyExtractor).toBe("markdown");
-    expect(normalizeEditorSettings({ dataGridCopyExtractor: "invalid" as any }).dataGridCopyExtractor).toBe("tsv");
+    expect(normalizeEditorSettings({ dataGridCopyExtractor: "invalid" as any }).dataGridCopyExtractor).toBe("smart");
   });
 
   it("normalizes persistent extractor configuration fail-fast defaults", () => {

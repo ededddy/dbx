@@ -223,7 +223,6 @@ function collectExpandedObjectSearchTargets(node: TreeNode, tasks: Promise<void>
   }
 }
 
-const isSearching = computed(() => !!deferredSearchQuery.value);
 const sidebarFilterGuards = computed(() => resolveSidebarFilterGuards(showConnectedConnectionsOnly.value, searchQuery.value, hasSearchScopeFilter.value));
 // Connected-only filtering changes only root visibility, so descendant-local
 // features stay available while operations requiring the full root list pause.
@@ -1178,7 +1177,7 @@ function findSchemaNode(nodes: TreeNode[], connId: string, database: string, sch
 }
 
 function onSearchToggle(node: TreeNode) {
-  if (!isSearching.value || !node.children) return;
+  if (!isTreeSearchFiltering.value || !node.children) return;
   const next = new Set(searchCollapsedIds.value);
   if (node.isExpanded) next.add(node.id);
   else next.delete(node.id);
@@ -1441,7 +1440,9 @@ watch(sidebarTableNameFilterOpen, (open) => {
 
 function collapseAllTreeNodes() {
   store.collapseAllTreeNodes();
-  if (isSearching.value) {
+  // 与 onSearchToggle 一致：scope-only 过滤也要填充 searchCollapsedIds，
+  // 否则 filteredNodes 会用空集合把所有分组重建成展开态，“全部折叠”空操作。
+  if (isTreeSearchFiltering.value) {
     searchCollapsedIds.value = new Set(flatTreeIndex.value.expandableNodeIds);
   }
 }

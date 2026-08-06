@@ -989,12 +989,12 @@ export const useConnectionStore = defineStore("connection", () => {
       gaussdb: "GaussDB",
       questdb: "QuestDB",
       kwdb: "KWDB",
-      kingbase: "KingBase",
+      kingbase: "人大金仓 KingbaseES",
       highgo: "瀚高 HighGo",
       uxdb: "优炫 UXDB",
       yashandb: "崖山 YashanDB",
-      vastbase: "Vastbase",
-      goldendb: "GoldenDB",
+      vastbase: "海量 Vastbase",
+      goldendb: "金篆 GoldenDB",
       access: "Microsoft Access",
       h2: "H2",
       snowflake: "Snowflake",
@@ -1008,9 +1008,10 @@ export const useConnectionStore = defineStore("connection", () => {
       cassandra: "Cassandra",
       bigquery: "BigQuery",
       kylin: "Kylin",
-      sundb: "SunDB",
+      sundb: "科蓝 SUNDB",
       oscar: "神通 OSCAR",
       influxdb: "InfluxDB",
+      victoriametrics: "VictoriaMetrics",
     };
 
     const profile = config.driver_profile || config.db_type;
@@ -2697,6 +2698,7 @@ export const useConnectionStore = defineStore("connection", () => {
         existing.label = config.name;
         existing.type = "connection";
         existing.connectionId = id;
+        existing.comment = config.note || null;
         existing.children = existing.children || [];
       } else {
         treeNodes.value.push({
@@ -2706,6 +2708,7 @@ export const useConnectionStore = defineStore("connection", () => {
           connectionId: id,
           isExpanded: false,
           children: [],
+          comment: config.note || null,
         });
       }
       return id;

@@ -308,6 +308,30 @@ impl LocalBackend {
     pub fn state(&self) -> &Arc<AppState> {
         &self.state
     }
+
+    /// Sync the latest connection list from storage into the `AppState.configs` in-memory cache:
+    /// upsert new/changed entries and remove connections deleted from storage. Only LocalBackend
+    /// needs this — WebBackend talks HTTP and holds no local AppState, and the desktop mcp_bridge
+    /// shares the DBX process so it is unaffected by this cache desync.
+    async fn sync_runtime_configs(&self, configs: &[ConnectionConfig]) {
+        let mut runtime = self.state.configs.write().await;
+        for config in configs {
+            match runtime.get(&config.id) {
+                Some(existing) if existing == config => {}
+                _ => {
+                    runtime.insert(config.id.clone(), config.clone());
+                }
+            }
+        }
+        let stale_ids: Vec<String> = runtime
+            .keys()
+            .filter(|id| !configs.iter().any(|config| &config.id == *id))
+            .cloned()
+            .collect();
+        for id in stale_ids {
+            runtime.remove(&id);
+        }
+    }
 }
 
 fn local_plugin_dir(settings: &DesktopSettings, data_dir: &Path) -> PathBuf {
@@ -329,7 +353,15 @@ impl DbxBackend for LocalBackend {
     }
 
     async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String> {
-        self.state.storage.load_connections().await
+        let configs = self.state.storage.load_connections().await?;
+        // Connections created/modified/deleted in the DBX desktop UI after this process started
+        // only update the shared SQLite storage; the AppState.configs in-memory cache is not kept
+        // in sync. Sync the latest config into the runtime cache after each read, otherwise DB
+        // operations that look up the pool by id via get_or_create_pool fail with
+        // "Connection config not found" (the agent can list the connection but cannot use it,
+        // and a manual MCP reload is needed to recover).
+        self.sync_runtime_configs(&configs).await;
+        Ok(configs)
     }
 
     async fn execute_agent_tool(

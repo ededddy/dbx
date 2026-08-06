@@ -428,6 +428,7 @@ const detailTooltip = computed(() => {
       { label: t("connection.user"), value: cleanTooltipValue(config.username) },
       { label: t("connection.type"), value: config.driver_label || config.driver_profile || config.db_type },
       { label: t("connection.databaseInfo.productVersion"), value: cleanTooltipValue(config.database_info?.productVersion) },
+      { label: t("connection.note"), value: cleanTooltipValue(config.note), multiline: true },
     ].filter((row) => row.value);
     return { rows };
   }
@@ -612,7 +613,9 @@ function formattedObjectStorage(): string {
   return formatSidebarObjectStorage(activeNode.value.sizeBytes);
 }
 
-const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" ? props.commentLabelWidth : undefined));
+// 连接节点不参与 aligned 对齐：顶层连接各自独立，按同层最大 label 宽对齐只会让短连接名
+// 后留下一大段空白。无论全局是 aligned 还是 inline，连接节点的 comment 都紧跟 label。
+const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" && activeNode.value.type !== "connection" ? props.commentLabelWidth : undefined));
 
 function alignedCommentLeadingStyle(): { width: string } | undefined {
   const width = alignedCommentLeadingWidth(alignedCommentLabelWidth.value, canTreeNodePin(activeNode.value.type));
@@ -627,7 +630,13 @@ const usesFullWidthLabel = computed(() => usesFullWidthTreeLabel(activeNode.valu
 
 const rowWidthClass = computed(() => (usesFullWidthLabel.value ? "w-max min-w-full" : "w-full min-w-0"));
 
-const labelWidthClass = computed(() => treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinned.value }));
+const labelWidthClass = computed(() => {
+  // aligned 模式靠 leading 块固定宽度对齐 comment 列，label 需 flex-1 撑满 leading 块；
+  // inline/right 模式 leading 块无固定宽度，label 用 shrink 让 comment 紧跟 label，
+  // 避免 label flex-1 把 leading 块撑到整行、comment 被推到视口最右端。
+  const alignLeading = alignedCommentLabelWidth.value !== undefined;
+  return treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinned.value, alignLeading });
+});
 
 watch(() => [isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
 
@@ -1151,7 +1160,7 @@ function onKeydown(event: KeyboardEvent) {
               @keydown.escape.prevent="isRenamingGroup = false"
               @click.stop
             />
-            <span v-else ref="labelRef" :class="[labelWidthClass, { 'flex-1': node.type === 'connection' }]">{{ visibleLabel(node) }}</span>
+            <span v-else ref="labelRef" :class="[labelWidthClass, { 'flex-1': node.type === 'connection' && !trailingComment }]">{{ visibleLabel(node) }}</span>
             <button
               v-if="canDragPinnedOrder()"
               type="button"
@@ -1186,7 +1195,7 @@ function onKeydown(event: KeyboardEvent) {
               {{ t("editor.defaultDatabase") }}
             </Badge>
           </div>
-          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-2 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
+          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-4 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
           <span v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0" class="min-w-0 flex-1" aria-hidden="true" />
           <span
             v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0"
