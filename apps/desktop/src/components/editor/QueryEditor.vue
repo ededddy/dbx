@@ -448,9 +448,9 @@ let tableReferenceDropListenerRegistered = false;
 let imeCompositionActive = false;
 let pendingImeModelEmit = false;
 
-function runStatementGutterExtension(markers = props.statementExecutionMarkers ?? []): import("@codemirror/state").Extension {
+function runStatementGutterExtension(): import("@codemirror/state").Extension {
   const showRunButtons = !props.hideExecutionControls && settingsStore.editorSettings.showStatementRunButtons;
-  return shouldShowStatementGutter(showRunButtons, markers.length) ? (buildRunStatementGutterExtension?.() ?? []) : [];
+  return shouldShowStatementGutter(showRunButtons) ? (buildRunStatementGutterExtension?.() ?? []) : [];
 }
 
 let executableStatementRangeCache: ExecutableStatementRangeCache | null = null;
@@ -4786,15 +4786,6 @@ watch(
 );
 
 watch(
-  () => props.statementExecutionMarkers?.length ?? 0,
-  () => {
-    if (!view.value || !runGutterComp) return;
-    // Remove the compartment entirely when controls and markers are absent so the editor keeps no empty gutter width.
-    view.value.dispatch({ effects: runGutterComp.reconfigure(runStatementGutterExtension()) });
-  },
-);
-
-watch(
   () => props.connectionId,
   () => {
     refreshCompletionCache();
@@ -5195,7 +5186,7 @@ defineExpose({
 }
 
 :deep(.cm-run-statement-gutter) {
-  min-width: 34px;
+  min-width: 28px;
 }
 
 :deep(.cm-run-statement-gutter .cm-gutterElement) {
@@ -5203,8 +5194,8 @@ defineExpose({
   box-sizing: border-box;
   display: flex;
   justify-content: center;
-  min-width: 34px;
-  padding: 0 5px;
+  min-width: 28px;
+  padding: 0 2px;
 }
 
 :deep(.cm-statement-execution-marker) {

@@ -359,8 +359,14 @@ export const nacosRollbackConfig = forward("nacosRollbackConfig");
 export const nacosGetRNacosConsoleCaptcha = forward("nacosGetRNacosConsoleCaptcha");
 export const nacosLoginRNacosConsole = forward("nacosLoginRNacosConsole");
 export const nacosListServices = forward("nacosListServices");
+export const nacosGetService = forward("nacosGetService");
+export const nacosCreateService = forward("nacosCreateService");
+export const nacosUpdateService = forward("nacosUpdateService");
+export const nacosDeleteService = forward("nacosDeleteService");
 export const nacosListInstances = forward("nacosListInstances");
 export const nacosUpdateInstance = forward("nacosUpdateInstance");
+export const nacosRegisterInstance = forward("nacosRegisterInstance");
+export const nacosDeregisterInstance = forward("nacosDeregisterInstance");
 export const nacosGetDashboard = forward("nacosGetDashboard");
 export const nacosRawRequest = forward("nacosRawRequest");
 

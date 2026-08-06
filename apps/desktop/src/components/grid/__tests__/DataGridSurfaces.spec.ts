@@ -222,6 +222,49 @@ describe("DataGridPagination", () => {
     await mounted.setProps({ loading: true });
     const busyNavigation = findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0");
     expect(busyNavigation.map((node) => node.props.disabled)).toEqual([true, true, true, true]);
+    expect(findOne(mounted.root, (node) => node.props["aria-label"] === "grid.jumpToPage").props.disabled).toBe(true);
+  });
+
+  it("jumps to an entered page and enforces page input boundaries", async () => {
+    const jumpPage = vi.fn();
+    const mounted = mountComponent(DataGridPagination, {
+      selectionSummary: null,
+      selectionSummarySumText: "",
+      loading: false,
+      infiniteScrollEnabled: false,
+      infiniteScrollAllLoaded: false,
+      pageSize: 100,
+      customPageSizeInput: "",
+      pageSizeMenuItems: [],
+      exportMenuItems: [],
+      currentPage: 3,
+      maxPage: 12,
+      canGoNextPage: true,
+      canJumpLastPage: true,
+      onJumpPage: jumpPage,
+    });
+    const pageInput = findOne(mounted.root, (node) => node.props["aria-label"] === "grid.jumpToPage");
+
+    expect(pageInput.props.modelValue).toBe("3");
+    pageInput.props["onUpdate:modelValue"]("8");
+    await nextTick();
+    const enter = dispatch(pageInput, "keydown", { key: "Enter" });
+    expect(enter.defaultPrevented).toBe(true);
+    expect(enter.propagationStopped).toBe(true);
+    expect(jumpPage).toHaveBeenLastCalledWith(8);
+
+    pageInput.props["onUpdate:modelValue"]("99");
+    await nextTick();
+    dispatch(pageInput, "keydown", { key: "Enter" });
+    expect(jumpPage).toHaveBeenLastCalledWith(12);
+
+    pageInput.props["onUpdate:modelValue"]("0");
+    await nextTick();
+    dispatch(pageInput, "keydown", { key: "Enter" });
+    await nextTick();
+    const resetPageInput = findOne(mounted.root, (node) => node.props["aria-label"] === "grid.jumpToPage");
+    expect(jumpPage).toHaveBeenCalledTimes(2);
+    expect(resetPageInput.props.modelValue).toBe("3");
   });
 
   it("hides pagination controls when the data source does not support paging", () => {

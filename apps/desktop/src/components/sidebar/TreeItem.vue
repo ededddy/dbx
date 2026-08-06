@@ -1102,7 +1102,7 @@ function onKeydown(event: KeyboardEvent) {
   </div>
 
   <div v-else @contextmenu="onTreeItemContextMenu">
-    <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="0" :surface="detailTooltip ? 'popover' : 'foreground'">
+    <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="30" :surface="detailTooltip ? 'popover' : 'foreground'">
       <div
         ref="rowRef"
         class="group flex items-center gap-2 py-1 px-2 cursor-pointer relative outline-none"

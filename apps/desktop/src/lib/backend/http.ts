@@ -183,8 +183,10 @@ import type {
   NacosConnectionInfo,
   NacosRNacosConsoleCaptcha,
   NacosInstanceInfo,
+  NacosInstanceRef,
+  NacosInstanceRegistration,
   NacosInstanceQuery,
-  NacosInstanceUpdate,
+  NacosInstanceUpdateRequest,
   NacosDashboardQuery,
   NacosDashboardSnapshot,
   NacosNamespaceCreate,
@@ -193,7 +195,9 @@ import type {
   NacosRawRequest,
   NacosRawResponse,
   NacosServiceList,
+  NacosServiceDetail,
   NacosServiceQuery,
+  NacosServiceUpsert,
   NacosSearchProgress,
 } from "@/types/nacos";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
@@ -2806,12 +2810,36 @@ export async function nacosListServices(connectionId: string, query: NacosServic
   return post("/api/nacos/services/list", { connectionId, query });
 }
 
+export async function nacosGetService(connectionId: string, query: NacosServiceQuery): Promise<NacosServiceDetail> {
+  return post("/api/nacos/services/get", { connectionId, query });
+}
+
+export async function nacosCreateService(connectionId: string, req: NacosServiceUpsert): Promise<void> {
+  return post("/api/nacos/services/create", { connectionId, req });
+}
+
+export async function nacosUpdateService(connectionId: string, req: NacosServiceUpsert): Promise<void> {
+  return post("/api/nacos/services/update", { connectionId, req });
+}
+
+export async function nacosDeleteService(connectionId: string, query: NacosServiceQuery): Promise<void> {
+  return post("/api/nacos/services/delete", { connectionId, query });
+}
+
 export async function nacosListInstances(connectionId: string, query: NacosInstanceQuery): Promise<NacosInstanceInfo[]> {
   return post("/api/nacos/instances/list", { connectionId, query });
 }
 
-export async function nacosUpdateInstance(connectionId: string, req: NacosInstanceUpdate): Promise<void> {
+export async function nacosUpdateInstance(connectionId: string, req: NacosInstanceUpdateRequest): Promise<void> {
   return post("/api/nacos/instances/update", { connectionId, req });
+}
+
+export async function nacosRegisterInstance(connectionId: string, req: NacosInstanceRegistration): Promise<void> {
+  return post("/api/nacos/instances/register", { connectionId, req });
+}
+
+export async function nacosDeregisterInstance(connectionId: string, req: NacosInstanceRef): Promise<void> {
+  return post("/api/nacos/instances/deregister", { connectionId, req });
 }
 
 export async function nacosGetDashboard(connectionId: string, query: NacosDashboardQuery): Promise<NacosDashboardSnapshot> {

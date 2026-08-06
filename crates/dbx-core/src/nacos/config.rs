@@ -147,10 +147,9 @@ impl NacosAdminConfig {
         }
         let context_path_is_explicit_root = self.context_path.trim() == "/";
         self.context_path = normalize_context_path(&self.context_path);
-        // Nacos 3 separates the console (normally :8080) from the server-side
-        // Admin API (normally :8848/nacos). Older DBX connection records did
-        // not persist the default server context, so repair only explicit
-        // Nacos 3 profiles here while preserving custom contexts.
+        // Nacos 3 management uses the server-side Admin API, normally
+        // `:8848/nacos`. Keep the documented default context for explicit V3
+        // profiles while preserving custom reverse-proxy prefixes.
         if self.context_path.is_empty()
             && !context_path_is_explicit_root
             && matches!(self.implementation, Some(NacosImplementation::Nacos))

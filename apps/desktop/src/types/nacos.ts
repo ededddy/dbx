@@ -5,6 +5,28 @@ export interface NacosCapabilities {
   supportsServiceManagement: boolean;
   supportsInstanceUpdate: boolean;
   supportsRawApi: boolean;
+  /** Naming capabilities are intentionally granular: servers such as r-nacos
+   * can expose discovery reads without supporting the official write APIs. */
+  serviceManagement?: NacosServiceCapabilities;
+}
+
+export interface NacosServiceCapabilities {
+  listServices: NacosOperationCapability;
+  getService: NacosOperationCapability;
+  createService: NacosOperationCapability;
+  updateService: NacosOperationCapability;
+  deleteService: NacosOperationCapability;
+  listInstances: NacosOperationCapability;
+  updateInstance: NacosOperationCapability;
+  registerInstance: NacosOperationCapability;
+  deregisterInstance: NacosOperationCapability;
+}
+
+export type NacosCapabilityReason = "implementationReadOnly" | "versionUnsupported" | "endpointUnavailable" | "notVerified" | "connectionReadOnly";
+
+export interface NacosOperationCapability {
+  supported: boolean;
+  reason?: NacosCapabilityReason;
 }
 
 export interface NacosConnectionInfo {
@@ -58,7 +80,6 @@ export interface NacosAdminConfig {
   implementation?: NacosImplementation;
   versionMode?: NacosVersionMode;
   serverAddr: string;
-  namespace?: string;
   contextPath?: string;
   rnacosConsoleAddr?: string;
   /** Undefined keeps the legacy behaviour: history is enabled when a console address exists. */
@@ -313,6 +334,25 @@ export interface NacosServiceList {
   items: NacosServiceInfo[];
 }
 
+export interface NacosServiceDetail {
+  serviceName: string;
+  groupName?: string;
+  metadata?: unknown;
+  protectThreshold?: number;
+  selector?: unknown;
+  ephemeral?: boolean;
+}
+
+export interface NacosServiceUpsert {
+  namespace?: string;
+  serviceName: string;
+  groupName?: string;
+  metadata?: unknown;
+  protectThreshold?: number;
+  selector?: unknown;
+  ephemeral?: boolean;
+}
+
 export interface NacosInstanceQuery {
   namespace?: string;
   serviceName: string;
@@ -333,18 +373,37 @@ export interface NacosInstanceInfo {
   metadata?: unknown;
 }
 
-export interface NacosInstanceUpdate {
+export interface NacosInstanceRef {
   namespace?: string;
   serviceName: string;
   ip: string;
   port: number;
   groupName?: string;
   clusterName?: string;
+  ephemeral?: boolean;
+}
+
+export interface NacosInstancePatch {
   healthy?: boolean;
   enabled?: boolean;
-  ephemeral?: boolean;
   weight?: number;
-  metadata?: unknown;
+  metadata?: Record<string, unknown>;
+}
+
+export interface NacosInstanceUpdateRequest {
+  target: NacosInstanceRef;
+  patch: NacosInstancePatch;
+}
+
+export interface NacosInstanceRegistration {
+  namespace?: string;
+  serviceName: string;
+  ip: string;
+  port: number;
+  groupName?: string;
+  clusterName?: string;
+  weight?: number;
+  metadata?: Record<string, unknown>;
 }
 
 export interface NacosDashboardQuery {

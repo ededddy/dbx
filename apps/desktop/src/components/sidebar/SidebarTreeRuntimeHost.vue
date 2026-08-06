@@ -116,6 +116,7 @@ import {
   buildCopyTableDataSql,
   buildEmptyTableSql,
   buildTruncateTableSql,
+  collectDuplicateTableColumnComments,
   duplicateTableStructureRequiresScript,
   supportsDropTableCascade,
   supportsTruncateTableCascade,
@@ -324,7 +325,7 @@ const emit = defineEmits<{
   "rename-started": [];
   "group-created": [groupId: string];
   "request-group-rename": [groupId: string];
-  "node-toggled": [node: TreeNode, wasExpanded: boolean];
+  "node-toggled": [node: TreeNode, expanded: boolean];
   "search-toggle": [node: TreeNode];
   "context-menu": [event: MouseEvent, node: TreeNode, items: ContextMenuItem[]];
   "open-ddl": [node: TreeNode];
@@ -3100,6 +3101,19 @@ function isDuplicateStructureSource(node: TreeNode): node is DuplicateStructureS
   return node.type === "table" && !!node.connectionId && !!node.database;
 }
 
+/** Dameng CTAS does not copy comments; load column comments for COMMENT ON COLUMN. */
+async function loadDamengDuplicateColumnComments(connectionId: string, database: string, schema: string | undefined, sourceName: string, catalog?: string, sourceColumns?: ColumnInfo[]): Promise<{ columns?: ColumnInfo[]; columnComments: Array<{ name: string; comment: string }> }> {
+  let columns = sourceColumns;
+  if (!columns) {
+    try {
+      columns = await api.getColumns(connectionId, database, schema || "", sourceName, catalog);
+    } catch (error) {
+      console.warn(`Failed to load Dameng column comments for table clone: ${sourceName}`, error);
+    }
+  }
+  return { columns, columnComments: collectDuplicateTableColumnComments(columns ?? []) };
+}
+
 async function confirmDuplicateStructure() {
   const node = duplicateStructureSource.value || (isDuplicateStructureSource(activeNode.value) ? activeNode.value : null);
   const newName = duplicateTableName.value.trim();
@@ -3109,12 +3123,14 @@ async function confirmDuplicateStructure() {
   try {
     await connectionStore.ensureConnected(node.connectionId);
     const databaseType = databaseTypeForNode(node);
+    const columnComments = databaseType === "dameng" ? (await loadDamengDuplicateColumnComments(node.connectionId, node.database, node.schema, node.label, node.catalog)).columnComments : [];
     const sql = await buildDuplicateTableStructureSql({
       databaseType,
       schema: node.schema,
       sourceName: node.label,
       targetName: newName,
       tableComment: node.comment,
+      columnComments,
     });
     await executeTreeNodeSqlWithProductionGuard(node, sql, {
       database: node.database,
@@ -3155,13 +3171,21 @@ async function confirmPasteTable() {
     try {
       await connectionStore.ensureConnected(entry.connectionId);
       const databaseType = entry.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(entry.connectionId)) : undefined;
+      let sourceColumns: ColumnInfo[] | undefined;
       if (mode === "structure-and-data" || mode === "structure-only") {
+        let columnComments: Array<{ name: string; comment: string }> = [];
+        if (databaseType === "dameng") {
+          const loaded = await loadDamengDuplicateColumnComments(entry.connectionId, entry.database, entry.schema, entry.sourceName);
+          sourceColumns = loaded.columns;
+          columnComments = loaded.columnComments;
+        }
         const structureSql = await buildDuplicateTableStructureSql({
           databaseType,
           schema: entry.schema,
           sourceName: entry.sourceName,
           targetName,
           tableComment: entry.tableComment,
+          columnComments,
         });
         const structureExecuted = await executeTreeNodeSqlWithProductionGuard(entry, structureSql, {
           database: entry.database,
@@ -3176,7 +3200,9 @@ async function confirmPasteTable() {
         queueRefreshTarget(entry);
       }
       if (copyData) {
-        const sourceColumns = await api.getColumns(entry.connectionId, entry.database, entry.schema || "", entry.sourceName);
+        if (!sourceColumns) {
+          sourceColumns = await api.getColumns(entry.connectionId, entry.database, entry.schema || "", entry.sourceName);
+        }
         const dataCopyColumnOptions = tableDataCopyColumnOptions(databaseType, sourceColumns);
         if (dataCopyColumnOptions.columns.length === 0) {
           throw new Error("No writable columns available for table data copy.");
@@ -4728,13 +4754,13 @@ function activateRuntimeNode(node: TreeNode) {
   activeNode.value = node;
 }
 
-// Async loaders can rebuild a connection node while awaiting the backend.
-// Publish the live tree node so a stale rendered row cannot reset expansion.
+// Async loaders can rebuild a connection node while awaiting the backend. Keep
+// the live node active for later actions, but publish the rendered node so the
+// tree owner can synchronize display projections without losing the toggle.
 function emitNodeToggled(node: TreeNode, wasExpanded: boolean, expandedOverride?: boolean) {
   const liveNode = findSidebarActionTarget(connectionStore.treeNodes, createSidebarActionTarget(node)) ?? node;
-  if (expandedOverride !== undefined) liveNode.isExpanded = expandedOverride;
   activeNode.value = liveNode;
-  emit("node-toggled", liveNode, wasExpanded);
+  emit("node-toggled", node, expandedOverride ?? !wasExpanded);
 }
 
 function activateActionTarget(target: SidebarActionTarget) {

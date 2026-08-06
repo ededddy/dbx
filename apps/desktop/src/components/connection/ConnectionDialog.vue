@@ -19,7 +19,7 @@ import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { VictoriaMetricsExternalConfig } from "@/types/victoriametrics";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { MqttConnectionConfig } from "@/types/mqtt";
-import type { NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosMetricsMode, NacosRNacosConsoleAuth, NacosVersionMode } from "@/types/nacos";
+import type { NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosMetricsMode, NacosNamespaceInfo, NacosRNacosConsoleAuth, NacosVersionMode } from "@/types/nacos";
 import { CONNECTION_ATTEMPT_CANCELLED_MESSAGE, useConnectionStore } from "@/stores/connectionStore";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { detachTunnelProfileLayer, tunnelProfileReferenceLayer, tunnelProfileSummary } from "@/lib/connection/tunnelProfiles";
@@ -64,7 +64,8 @@ import { normalizeRabbitmqAddresses } from "@/lib/connection/rabbitmqAddresses";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
-import { nacosMetricsCandidates, normalizeNacosEndpoint, normalizeNacosMetricsUrl } from "@/lib/nacos/nacosAdmin";
+import { normalizeNacosEndpoint, normalizeNacosMetricsUrl } from "@/lib/nacos/nacosAdmin";
+import { normalizeNacosNamespaceSelection, normalizeNacosNamespacesForDisplay } from "@/lib/nacos/nacosNamespaceVisibility";
 import {
   ArrowLeft,
   ArrowDown,
@@ -115,6 +116,7 @@ export type ConfigTab = "connection" | "advanced" | "tls" | "transport";
 type ProductionScope = "connection" | "databases";
 type MqTokenSigningMode = "none" | "hs256" | "rs256";
 type NacosAuthKind = NacosAuthConfig["kind"];
+type NacosConnectionProfile = "v2" | "v3" | "rnacos";
 type DremioConnectionMode = "arrow-flight-sql" | "legacy";
 type JdbcDriverSelectItem = {
   id: string;
@@ -128,6 +130,11 @@ const DREMIO_ARROW_FLIGHT_SQL_JDBC_DRIVER_CLASS = "org.apache.arrow.driver.jdbc.
 const DREMIO_LEGACY_JDBC_URL = "jdbc:dremio:direct=127.0.0.1:31010";
 const DREMIO_LEGACY_JDBC_DRIVER_CLASS = "com.dremio.jdbc.Driver";
 const DEFAULT_SSH_USER = "root";
+const NACOS_CONNECTION_PROFILES: ReadonlyArray<{ value: NacosConnectionProfile; title: string }> = [
+  { value: "v2", title: "Nacos 2.x" },
+  { value: "v3", title: "Nacos 3.x" },
+  { value: "rnacos", title: "r-nacos" },
+];
 
 type LegacyTransportFields = {
   ssh_enabled?: boolean;
@@ -150,7 +157,6 @@ type LegacyTransportFields = {
 type LegacyConnectionConfig = ConnectionConfig & LegacyTransportFields;
 type ConnectionForm = Omit<ConnectionConfig, "id">;
 type ConnectionTestState = ConnectionTestResult & { ok: boolean };
-type SuccessfulConnectionTest = { result: ConnectionTestResult; config: ConnectionConfig };
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -201,6 +207,12 @@ const visibleDatabaseSelection = ref<Set<string>>(new Set());
 const visibleDatabaseSearchText = ref("");
 const visibleDatabaseError = ref("");
 const visibleDatabaseShowSystem = ref(false);
+const showVisibleNacosNamespacesDialog = ref(false);
+const isLoadingVisibleNacosNamespaces = ref(false);
+const visibleNacosNamespaces = ref<NacosNamespaceInfo[]>([]);
+const visibleNacosNamespaceSelection = ref<Set<string>>(new Set());
+const visibleNacosNamespaceSearchText = ref("");
+const visibleNacosNamespaceError = ref("");
 const showProductionDatabasesDialog = ref(false);
 const isLoadingProductionDatabases = ref(false);
 const productionDatabaseNames = ref<string[]>([]);
@@ -673,11 +685,11 @@ const mqKafkaSaslMechanismOptions = [
   { value: "SCRAM-SHA-512", label: "SCRAM-SHA-512" },
 ];
 const nacosImplementation = ref<NacosImplementation>("nacos");
-const nacosVersionMode = ref<NacosVersionMode>("auto");
+// Nacos 2 and 3 expose different API planes (and Nacos 3 commonly needs a
+// separate Console address). New connections must therefore choose an
+// explicit version instead of relying on endpoint-shape guessing.
+const nacosVersionMode = ref<NacosVersionMode>("v2");
 const nacosServerAddr = ref("");
-const nacosNamespace = ref("");
-const nacosContextPath = ref("");
-const nacosContextPathCustomized = ref(false);
 const nacosRNacosConsoleAddr = ref("");
 const nacosHistoryEnabled = ref(false);
 const nacosConsoleAuthKind = ref<NacosRNacosConsoleAuth["kind"]>("inherit");
@@ -706,63 +718,20 @@ const mqttTlsSkipVerify = ref(false);
 const mqttKeepAliveSecs = ref(60);
 const mqttConnectTimeoutSecs = ref(30);
 const mqttMaxPacketSizeBytes = ref(16 * 1024 * 1024);
-
-const nacosPrimaryAddressLabel = computed(() => {
-  if (nacosImplementation.value === "rnacos") return t("connection.nacosPrimaryAddressRNacos");
-  if (nacosVersionMode.value === "v2") return t("connection.nacosPrimaryAddressV2");
-  if (nacosVersionMode.value === "v3") return t("connection.nacosPrimaryAddressV3");
-  return t("connection.nacosPrimaryAddressAuto");
-});
 const nacosPrimaryAddressPlaceholder = computed(() => {
   return "http://127.0.0.1:8848/nacos";
 });
-const nacosNormalizedPreview = computed(() => {
-  if (!nacosServerAddr.value.trim()) return "";
+const nacosV3AdminEndpointWarning = computed(() => {
+  if (nacosImplementation.value !== "nacos" || nacosVersionMode.value !== "v3" || !nacosServerAddr.value.trim()) return "";
   try {
-    const normalized = normalizeNacosEndpoint(nacosServerAddr.value, {
-      implementation: nacosImplementation.value,
-      versionMode: nacosVersionMode.value,
-      contextPath: nacosContextPathCustomized.value ? nacosContextPath.value : undefined,
-    });
-    return `${normalized.serverAddr}${normalized.contextPath || ""}`;
+    const url = new URL(nacosServerAddr.value.trim());
+    if (url.port === "8080") {
+      return t("nacos.nacosV3ConsolePortWarning");
+    }
   } catch {
-    return "";
+    // The normal form validation will report an invalid URL on save.
   }
-});
-const nacosEffectiveContextPath = computed(() => {
-  if (!nacosServerAddr.value.trim()) {
-    return nacosContextPathCustomized.value ? nacosContextPath.value.trim() || "/" : "/nacos";
-  }
-  try {
-    const normalized = normalizeNacosEndpoint(nacosServerAddr.value, {
-      implementation: nacosImplementation.value,
-      versionMode: nacosVersionMode.value,
-      contextPath: nacosContextPathCustomized.value ? nacosContextPath.value : undefined,
-    });
-    return normalized.contextPath || "/";
-  } catch {
-    return nacosContextPathCustomized.value ? nacosContextPath.value.trim() || "/" : "/";
-  }
-});
-const nacosContextPathInput = computed({
-  get: () => (nacosContextPathCustomized.value ? nacosContextPath.value : nacosEffectiveContextPath.value),
-  set: (value: string) => {
-    nacosContextPathCustomized.value = true;
-    nacosContextPath.value = value;
-  },
-});
-const nacosMetricsAutoPreview = computed(() => {
-  if (!nacosNormalizedPreview.value) return "";
-  try {
-    const normalized = normalizeNacosEndpoint(nacosServerAddr.value, {
-      implementation: nacosImplementation.value,
-      versionMode: nacosVersionMode.value,
-      contextPath: nacosContextPathCustomized.value ? nacosContextPath.value : undefined,
-    });
-    return nacosMetricsCandidates(normalized.serverAddr, normalized.contextPath, nacosImplementation.value).join(" · ");
-  } catch {
-    return "";
-  }
+  return "";
 });
 const nacosMetricsUrlError = computed(() => {
   if (nacosMetricsMode.value !== "custom") return "";
@@ -774,13 +743,22 @@ const nacosMetricsUrlError = computed(() => {
   }
 });
 
-function resetNacosContextPathCustomization() {
-  nacosContextPathCustomized.value = false;
-  nacosContextPath.value = "";
+const nacosConnectionProfile = computed<NacosConnectionProfile>(() => {
+  if (nacosImplementation.value === "rnacos") return "rnacos";
+  return nacosVersionMode.value === "v3" ? "v3" : "v2";
+});
+
+function selectNacosConnectionProfile(profile: NacosConnectionProfile) {
+  if (profile === "rnacos") {
+    nacosImplementation.value = "rnacos";
+    return;
+  }
+  nacosImplementation.value = "nacos";
+  nacosVersionMode.value = profile;
 }
 
 watch(nacosImplementation, (implementation) => {
-  if (implementation === "rnacos") nacosVersionMode.value = "auto";
+  if (implementation === "rnacos") nacosVersionMode.value = "v2";
   if (implementation !== "rnacos") nacosHistoryEnabled.value = false;
 });
 
@@ -1211,11 +1189,12 @@ watch(mqAuthKind, (kind) => {
 
 function resetNacosFields(config?: Partial<NacosAdminConfig>) {
   nacosImplementation.value = config?.implementation || (config?.rnacosConsoleAddr ? "rnacos" : "nacos");
-  nacosVersionMode.value = config?.versionMode || "auto";
-  nacosServerAddr.value = config?.serverAddr?.trim() || "";
-  nacosNamespace.value = config?.namespace || "";
-  nacosContextPath.value = config?.contextPath || "";
-  nacosContextPathCustomized.value = !!config?.contextPath;
+  // Saved `auto` profiles are legacy records. The form always saves an
+  // explicit selection and no longer relies on a separate Console address.
+  nacosVersionMode.value = config?.versionMode === "v3" ? "v3" : "v2";
+  const serverAddr = config?.serverAddr?.trim() || "";
+  const contextPath = config?.contextPath?.trim() || "";
+  nacosServerAddr.value = serverAddr && contextPath && contextPath !== "/" && !serverAddr.endsWith(contextPath) ? `${serverAddr.replace(/\/+$/, "")}/${contextPath.replace(/^\/+/, "")}` : serverAddr;
   nacosRNacosConsoleAddr.value = config?.rnacosConsoleAddr?.trim() || "";
   nacosHistoryEnabled.value = config?.rnacosHistoryEnabled ?? !!config?.rnacosConsoleAddr;
   const consoleAuth = config?.rnacosConsoleAuth || { kind: "inherit" };
@@ -1507,13 +1486,14 @@ function buildNacosAdminConfig(): NacosAdminConfig {
   const normalized = normalizeNacosEndpoint(primaryAddress, {
     implementation: nacosImplementation.value,
     versionMode: nacosVersionMode.value,
-    contextPath: nacosContextPathCustomized.value ? nacosContextPath.value : undefined,
+    contextPath: undefined,
   });
   if (nacosImplementation.value === "rnacos" && normalized.warnings.length) {
     throw new Error(t("connection.nacosRNacosOpenApiRequired"));
   }
-  const rnacosConsoleConfigured = nacosImplementation.value === "rnacos" && !!nacosRNacosConsoleAddr.value.trim();
-  if (nacosImplementation.value === "rnacos" && nacosHistoryEnabled.value && !rnacosConsoleConfigured) {
+  const rnacosExtensionsEnabled = nacosImplementation.value === "rnacos" && nacosHistoryEnabled.value;
+  const rnacosConsoleConfigured = rnacosExtensionsEnabled && !!nacosRNacosConsoleAddr.value.trim();
+  if (rnacosExtensionsEnabled && !rnacosConsoleConfigured) {
     throw new Error(t("connection.nacosRNacosConsoleUrlRequired"));
   }
   let rnacosConsoleAuth: NacosRNacosConsoleAuth | undefined;
@@ -1541,9 +1521,8 @@ function buildNacosAdminConfig(): NacosAdminConfig {
     implementation: nacosImplementation.value,
     versionMode: nacosImplementation.value === "nacos" ? nacosVersionMode.value : undefined,
     serverAddr: normalized.serverAddr,
-    namespace: nacosNamespace.value.trim() || undefined,
     contextPath: normalized.contextPath || undefined,
-    rnacosConsoleAddr: nacosImplementation.value === "rnacos" ? nacosRNacosConsoleAddr.value.trim() || undefined : undefined,
+    rnacosConsoleAddr: rnacosExtensionsEnabled ? nacosRNacosConsoleAddr.value.trim() || undefined : undefined,
     rnacosHistoryEnabled: nacosImplementation.value === "rnacos" ? nacosHistoryEnabled.value : undefined,
     rnacosConsoleAuth,
     auth: buildNacosAuth(),
@@ -1552,49 +1531,6 @@ function buildNacosAdminConfig(): NacosAdminConfig {
     metricsUrl,
     pageSize: Number(nacosPageSize.value) > 0 ? Number(nacosPageSize.value) : 20,
   };
-}
-
-function dockerNacosConsoleFallbackUrl(serverAddr: string): string | null {
-  let parsed: URL;
-  try {
-    parsed = new URL(serverAddr);
-  } catch {
-    return null;
-  }
-  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-  const host = parsed.hostname.toLowerCase();
-  if (port !== "8848" || !["127.0.0.1", "localhost", "::1"].includes(host)) return null;
-
-  parsed.port = "8085";
-  return parsed.toString().replace(/\/$/, "");
-}
-
-function isNacosAdminEndpointNotFound(message: string): boolean {
-  return /Nacos admin endpoint was not found/i.test(message);
-}
-
-async function tryNacosDockerConsoleFallback(config: ConnectionConfig, originalError: string, runId: number): Promise<SuccessfulConnectionTest | null> {
-  if (config.db_type !== "nacos" || !isNacosAdminEndpointNotFound(originalError)) return null;
-
-  const fallbackUrl = dockerNacosConsoleFallbackUrl(nacosServerAddr.value);
-  if (!fallbackUrl || fallbackUrl === nacosServerAddr.value.trim()) return null;
-
-  const previousUrl = nacosServerAddr.value;
-  nacosServerAddr.value = fallbackUrl;
-  try {
-    const fallbackConfig = connectionConfigForSubmit(config.id, config.name);
-    const result = await testConnectionWithTimeout(fallbackConfig, runId);
-    return {
-      config: fallbackConfig,
-      result: {
-        ...result,
-        message: `${result.message} ${t("connection.nacosConsoleUrlAutoAdjusted", { from: previousUrl.trim(), to: fallbackUrl })}`,
-      },
-    };
-  } catch {
-    nacosServerAddr.value = previousUrl;
-    return null;
-  }
 }
 
 function errorMessage(error: unknown): string {
@@ -2858,7 +2794,8 @@ const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && 
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
 const agentDriverFocus = computed<DriverStoreFocus>(() => ({ target: "driver", driver: agentDriverInstallKey(form.value.db_type, form.value.driver_profile) }));
-const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
+const canChooseVisibleNacosNamespaces = computed(() => form.value.db_type === "nacos");
+const canChooseVisibleDatabases = computed(() => !canChooseVisibleNacosNamespaces.value && connectionCanChooseVisibleDatabases(form.value));
 const visibleFilterUsesSchemas = computed(() => connectionUsesVisibleSchemaFilter(form.value));
 const hasVisibleDatabaseFilter = computed(() => Array.isArray(form.value.visible_databases));
 const visibleDatabaseSummary = computed(() => {
@@ -2882,6 +2819,16 @@ const visibleDatabaseTotalCount = computed(() => listedVisibleDatabaseNames.valu
 const visibleDatabaseCanSave = computed(() => canSaveVisibleDatabaseSelection([...visibleDatabaseSelection.value]));
 const visibleDatabaseHasSystemObjects = computed(() => defaultListedVisibleDatabaseNames.value.length < visibleDatabaseNames.value.length);
 const visibleSystemObjectsLabelKey = computed(() => (visibleFilterUsesSchemas.value ? "visibleSchemas.showSystemSchemas" : "visibleDatabases.showSystemDatabases"));
+const filteredVisibleNacosNamespaces = computed(() => {
+  const query = visibleNacosNamespaceSearchText.value.trim().toLowerCase();
+  if (!query) return visibleNacosNamespaces.value;
+  return visibleNacosNamespaces.value.filter((namespace) => {
+    const label = namespace.namespaceShowName || namespace.namespace || "public";
+    return `${label} ${namespace.namespace}`.toLowerCase().includes(query);
+  });
+});
+const visibleNacosNamespaceSelectedCount = computed(() => visibleNacosNamespaceSelection.value.size);
+const visibleNacosNamespaceCanSave = computed(() => visibleNacosNamespaceSelection.value.size > 0);
 const filteredProductionDatabaseNames = computed(() => {
   const query = productionDatabaseSearchText.value.trim().toLowerCase();
   if (!query) return productionDatabaseNames.value;
@@ -3028,7 +2975,7 @@ const agentInstallProgressLabel = computed(() => {
 });
 const canCloseAgentInstallDialog = computed(() => !agentInstallRunning.value || !!agentInstallError.value);
 const sqlServerDriverMode = computed<"auto" | "legacy">(() => (sqlServerUsesLegacyCompatibility(form.value) ? "legacy" : "auto"));
-const shouldUseWideConnectionDialog = computed(() => dialogStep.value === "config" && (canChooseVisibleDatabases.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value)));
+const shouldUseWideConnectionDialog = computed(() => dialogStep.value === "config" && (canChooseVisibleDatabases.value || canChooseVisibleNacosNamespaces.value || (canChooseVisibleSchemas.value && !visibleFilterUsesSchemas.value)));
 const connectionDialogContentClass = computed(() => {
   if (dialogStep.value === "select") return "connection-dialog-content--picker sm:h-[720px] sm:max-w-[880px]";
   const widthClass = shouldUseWideConnectionDialog.value ? "connection-dialog-content--wide sm:max-w-[660px]" : "connection-dialog-content--standard sm:max-w-[560px]";
@@ -3147,21 +3094,13 @@ async function testConnection() {
     if (runId !== testRunId) return;
     const rawMessage = mongodbAuthFailureHint(errorMessage(e));
     const message = config ? connectionErrorWithDriverUpdateHint(config, rawMessage) : rawMessage;
-    const fallback = config ? await tryNacosDockerConsoleFallback(config, message, runId) : null;
-    if (runId !== testRunId) return;
-    if (fallback) {
-      applySuccessfulConnectionTest(fallback.result, fallback.config, submittedSourceName);
-      void persistSuccessfulConnectionTest(fallback.result, fallback.config, submittedSourceName, runId);
-      clearEditedConnectionErrorAfterSuccessfulTest();
-    } else {
-      const shouldShowSqlServerLegacyMode = config?.db_type === "sqlserver" && !sqlServerUsesLegacyCompatibility(config) && isSqlServerTlsHandshakeFailure(message);
-      if (shouldShowSqlServerLegacyMode) {
-        configTab.value = "advanced";
-      }
-      clearTestedConnectionInfo();
-      testResult.value = { ok: false, message };
-      showConnectionError(message);
+    const shouldShowSqlServerLegacyMode = config?.db_type === "sqlserver" && !sqlServerUsesLegacyCompatibility(config) && isSqlServerTlsHandshakeFailure(message);
+    if (shouldShowSqlServerLegacyMode) {
+      configTab.value = "advanced";
     }
+    clearTestedConnectionInfo();
+    testResult.value = { ok: false, message };
+    showConnectionError(message);
   } finally {
     if (runId === testRunId) {
       isTesting.value = false;
@@ -3452,7 +3391,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     applyNacosServerAddr(config, nacosConfig.serverAddr);
     config.username = nacosAuthKind.value === "usernamePassword" ? nacosUsername.value.trim() : "";
     config.password = nacosAuthKind.value === "usernamePassword" ? nacosPassword.value : "";
-    config.database = nacosConfig.namespace || undefined;
+    config.database = undefined;
     config.connection_string = undefined;
     config.url_params = "";
   } else if (config.db_type === "mqtt") {
@@ -3898,6 +3837,15 @@ function resetVisibleDatabaseDraftState() {
   visibleDatabaseShowSystem.value = false;
 }
 
+function resetVisibleNacosNamespaceDraftState() {
+  showVisibleNacosNamespacesDialog.value = false;
+  isLoadingVisibleNacosNamespaces.value = false;
+  visibleNacosNamespaces.value = [];
+  visibleNacosNamespaceSelection.value = new Set();
+  visibleNacosNamespaceSearchText.value = "";
+  visibleNacosNamespaceError.value = "";
+}
+
 function resetProductionDatabaseDraftState() {
   showProductionDatabasesDialog.value = false;
   isLoadingProductionDatabases.value = false;
@@ -3965,6 +3913,78 @@ async function openVisibleDatabasesPicker() {
     await api.disconnectDb(draftId).catch(() => undefined);
     isLoadingVisibleDatabases.value = false;
   }
+}
+
+function nacosNamespaceValue(namespace: NacosNamespaceInfo): string {
+  return namespace.namespace || "";
+}
+
+function nacosNamespaceLabel(namespace: NacosNamespaceInfo): string {
+  return namespace.namespaceShowName || namespace.namespace || "public";
+}
+
+function normalizeVisibleNacosNamespaceSelection(selected: Iterable<string>, namespaces: NacosNamespaceInfo[]): string[] {
+  return normalizeNacosNamespaceSelection(selected, namespaces);
+}
+
+async function openVisibleNacosNamespacesPicker() {
+  if (!ensureConnectionHostResolvedFromUrl()) return;
+  if (!canChooseVisibleNacosNamespaces.value || isLoadingVisibleNacosNamespaces.value) return;
+
+  isLoadingVisibleNacosNamespaces.value = true;
+  visibleNacosNamespaceError.value = "";
+  visibleNacosNamespaceSearchText.value = "";
+  const draftId = buildDraftVisibleDatabasesConnectionId(uuid());
+
+  try {
+    const draftConfig = {
+      ...connectionConfigForSubmit(draftId),
+      id: draftId,
+      one_time: true,
+    };
+    await api.connectDb(draftConfig);
+    const namespaces = normalizeNacosNamespacesForDisplay(await api.nacosListNamespaces(draftId));
+    visibleNacosNamespaces.value = [...namespaces].sort((left, right) => nacosNamespaceLabel(left).localeCompare(nacosNamespaceLabel(right)));
+    const configured = form.value.visible_databases;
+    const initialSelection = Array.isArray(configured) ? normalizeVisibleNacosNamespaceSelection(configured, visibleNacosNamespaces.value) : visibleNacosNamespaces.value.map(nacosNamespaceValue);
+    visibleNacosNamespaceSelection.value = new Set(initialSelection);
+    showVisibleNacosNamespacesDialog.value = true;
+  } catch (e: any) {
+    visibleNacosNamespaces.value = [];
+    visibleNacosNamespaceSelection.value = new Set();
+    visibleNacosNamespaceError.value = errorMessage(e);
+    testResult.value = { ok: false, message: visibleNacosNamespaceError.value };
+    showVisibleNacosNamespacesDialog.value = true;
+  } finally {
+    await api.disconnectDb(draftId).catch(() => undefined);
+    isLoadingVisibleNacosNamespaces.value = false;
+  }
+}
+
+function toggleVisibleNacosNamespace(namespace: string) {
+  const next = new Set(visibleNacosNamespaceSelection.value);
+  if (next.has(namespace)) next.delete(namespace);
+  else next.add(namespace);
+  visibleNacosNamespaceSelection.value = next;
+}
+
+function selectAllVisibleNacosNamespaces() {
+  visibleNacosNamespaceSelection.value = new Set(visibleNacosNamespaces.value.map(nacosNamespaceValue));
+}
+
+function clearVisibleNacosNamespaceSelection() {
+  visibleNacosNamespaceSelection.value = new Set();
+}
+
+function showAllVisibleNacosNamespaces() {
+  form.value.visible_databases = undefined;
+  resetVisibleNacosNamespaceDraftState();
+}
+
+function saveVisibleNacosNamespaceSelection() {
+  if (!visibleNacosNamespaceCanSave.value) return;
+  form.value.visible_databases = normalizeVisibleNacosNamespaceSelection(visibleNacosNamespaceSelection.value, visibleNacosNamespaces.value);
+  showVisibleNacosNamespacesDialog.value = false;
 }
 
 async function loadVisibleDatabaseNames(connectionId: string, config: ConnectionConfig): Promise<string[]> {
@@ -4233,6 +4253,7 @@ function resetForm() {
   selectedDbCategory.value = "sql";
   configTab.value = "connection";
   resetVisibleDatabaseDraftState();
+  resetVisibleNacosNamespaceDraftState();
   resetProductionDatabaseDraftState();
   resetVisibleSchemasState();
   resetTestState();
@@ -5085,7 +5106,7 @@ function openExternalUrl(url: string) {
             </div>
 
             <TabsContent value="connection" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
-              <div class="connection-form-body grid min-h-0 flex-1 gap-4 overflow-y-auto pt-4 pr-2 pb-2">
+              <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto pt-4 pr-2 pb-6" :class="{ 'connection-form-body--nacos': form.db_type === 'nacos' }">
                 <div v-if="!isJdbcConnection && form.db_type !== 'nacos'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelClass">{{ t("connection.connectionUrlOptional") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
@@ -5654,146 +5675,74 @@ function openExternalUrl(url: string) {
 
                 <!-- Nacos: profile-aware endpoint, namespace and auth -->
                 <template v-else-if="form.db_type === 'nacos'">
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosImplementation") }}</Label>
-                    <div class="col-span-3 flex gap-2">
-                      <Button size="sm" :variant="nacosImplementation === 'nacos' ? 'default' : 'outline'" @click="nacosImplementation = 'nacos'">Nacos</Button>
-                      <Button size="sm" :variant="nacosImplementation === 'rnacos' ? 'default' : 'outline'" @click="nacosImplementation = 'rnacos'">r-nacos</Button>
+                  <section data-nacos-profile-selector class="overflow-hidden rounded-lg border bg-muted/10">
+                    <div class="border-b px-4 py-3">
+                      <div class="text-sm font-medium">{{ t("nacos.nacosConnectionPlan") }}</div>
+                      <p class="mt-0.5 text-xs leading-5 text-muted-foreground">{{ t("nacos.nacosConnectionPlanDescription") }}</p>
                     </div>
-                  </div>
-                  <div v-if="nacosImplementation === 'nacos'" class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosVersion") }}</Label>
-                    <div class="col-span-3 flex flex-wrap gap-2">
-                      <Button size="sm" :variant="nacosVersionMode === 'auto' ? 'default' : 'outline'" @click="nacosVersionMode = 'auto'">{{ t("connection.nacosVersionAuto") }}</Button>
-                      <Button size="sm" :variant="nacosVersionMode === 'v2' ? 'default' : 'outline'" @click="nacosVersionMode = 'v2'">2.x</Button>
-                      <Button size="sm" :variant="nacosVersionMode === 'v3' ? 'default' : 'outline'" @click="nacosVersionMode = 'v3'">3.x</Button>
+                    <div class="grid grid-cols-3 gap-2 p-3">
+                      <button
+                        v-for="profile in NACOS_CONNECTION_PROFILES"
+                        :key="profile.value"
+                        type="button"
+                        class="min-w-0 rounded-md border px-3 py-2.5 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        :class="nacosConnectionProfile === profile.value ? 'border-primary bg-primary/5 shadow-sm' : 'border-border bg-background'"
+                        :aria-pressed="nacosConnectionProfile === profile.value"
+                        @click="selectNacosConnectionProfile(profile.value)"
+                      >
+                        <span class="block truncate text-sm font-medium">{{ profile.title }}</span>
+                      </button>
                     </div>
-                  </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ nacosPrimaryAddressLabel }}</Label>
-                    <Input v-model="nacosServerAddr" class="col-span-3" :placeholder="nacosPrimaryAddressPlaceholder" />
-                  </div>
-                  <div class="grid grid-cols-4 items-start gap-4">
-                    <span />
-                    <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">{{ t("connection.nacosPrimaryAddressHint") }}</p>
-                  </div>
-                  <div v-if="nacosNormalizedPreview" class="grid grid-cols-4 items-start gap-4">
-                    <span />
-                    <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">{{ t("connection.nacosRequestsUse", { address: nacosNormalizedPreview }) }}</p>
-                  </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosContextPath") }}</Label>
-                    <div class="col-span-3 flex min-w-0 items-center gap-2">
-                      <Input v-model="nacosContextPathInput" class="min-w-0 flex-1" :placeholder="t('connection.nacosContextPathPlaceholder')" />
-                      <Button v-if="nacosContextPathCustomized" type="button" size="sm" variant="ghost" @click="resetNacosContextPathCustomization">{{ t("connection.nacosContextPathRestoreAuto") }}</Button>
-                    </div>
-                  </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosNamespace") }}</Label>
-                    <Input v-model="nacosNamespace" class="col-span-3" placeholder="public" />
-                  </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosMetrics") }}</Label>
-                    <Select v-model="nacosMetricsMode">
-                      <SelectTrigger class="col-span-3 h-9">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="auto">{{ t("connection.nacosMetricsAuto") }}</SelectItem>
-                        <SelectItem value="disabled">{{ t("connection.nacosMetricsDisabled") }}</SelectItem>
-                        <SelectItem value="custom">{{ t("connection.nacosMetricsCustom") }}</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div v-if="nacosMetricsMode === 'auto' && nacosMetricsAutoPreview" class="grid grid-cols-4 items-start gap-4">
-                    <span />
-                    <p class="col-span-3 m-0 break-all text-xs leading-5 text-muted-foreground">{{ t("connection.nacosMetricsAutoHint", { addresses: nacosMetricsAutoPreview }) }}</p>
-                  </div>
-                  <div v-if="nacosMetricsMode === 'custom'" class="grid grid-cols-4 items-start gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosMetricsUrl") }}</Label>
-                    <div class="col-span-3">
-                      <Input v-model="nacosMetricsUrl" :aria-invalid="!!nacosMetricsUrlError" :class="{ 'border-destructive focus-visible:ring-destructive': nacosMetricsUrlError }" placeholder="http://127.0.0.1:8818/nacos/actuator/prometheus" />
-                      <p v-if="nacosMetricsUrlError" class="mt-1 text-xs text-destructive">{{ nacosMetricsUrlError }}</p>
-                    </div>
-                  </div>
-                  <template v-if="nacosImplementation === 'rnacos'">
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ t("connection.nacosConfigurationHistory") }}</Label>
-                      <div class="col-span-3 flex items-center gap-2">
-                        <label class="inline-flex items-center gap-2">
-                          <Switch v-model="nacosHistoryEnabled" />
-                          <span class="text-xs text-muted-foreground">{{ t("connection.nacosConfigurationHistoryEnable") }}</span>
-                        </label>
-                        <Tooltip>
-                          <TooltipTrigger as-child>
-                            <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                          </TooltipTrigger>
-                          <TooltipContent side="top" align="start" class="max-w-[360px] text-xs leading-relaxed">
-                            {{ t("connection.nacosConfigurationHistoryHint") }}
-                          </TooltipContent>
-                        </Tooltip>
+                  </section>
+
+                  <section data-nacos-endpoint-section class="rounded-lg border p-4">
+                    <div class="grid gap-4">
+                      <div class="grid gap-1.5">
+                        <Label>{{ t("nacos.nacosServiceAddress") }}</Label>
+                        <Input v-model="nacosServerAddr" :placeholder="nacosPrimaryAddressPlaceholder" />
+                        <p class="text-xs leading-5 text-muted-foreground">
+                          <template>{{ t("nacos.nacosServiceAddressHint") }}</template>
+                        </p>
                       </div>
+                      <p v-if="nacosV3AdminEndpointWarning" class="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs leading-5 text-amber-700 dark:text-amber-400">
+                        {{ nacosV3AdminEndpointWarning }}
+                      </p>
                     </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ t("connection.nacosRNacosConsoleUrl") }}</Label>
-                      <Input v-model="nacosRNacosConsoleAddr" class="col-span-3" :placeholder="t('connection.nacosRNacosConsoleUrlPlaceholder')" />
+                  </section>
+
+                  <section data-nacos-access-section class="rounded-lg border p-4">
+                    <div class="mb-4">
+                      <div class="text-sm font-medium">{{ t("nacos.nacosAuth") }}</div>
+                      <p class="mt-0.5 text-xs text-muted-foreground">{{ t("nacos.nacosAuthHint") }}</p>
                     </div>
-                    <div class="grid grid-cols-4 items-start gap-4">
-                      <span />
-                      <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">{{ t("connection.nacosRNacosConsoleUrlHint") }}</p>
-                    </div>
-                    <template v-if="nacosRNacosConsoleAddr.trim()">
-                      <div class="grid grid-cols-4 items-center gap-4">
-                        <Label :class="connectionLabelClass">{{ t("connection.nacosConsoleAuthentication") }}</Label>
-                        <div class="col-span-3 flex gap-2">
-                          <Button size="sm" :variant="nacosConsoleAuthKind === 'inherit' ? 'default' : 'outline'" :disabled="nacosAuthKind === 'none'" @click="nacosConsoleAuthKind = 'inherit'">{{ t("connection.nacosConsoleAuthInherit") }}</Button>
-                          <Button size="sm" :variant="nacosConsoleAuthKind === 'usernamePassword' ? 'default' : 'outline'" @click="nacosConsoleAuthKind = 'usernamePassword'">{{ t("connection.nacosConsoleAuthSeparate") }}</Button>
+                    <div class="grid max-w-md gap-1.5">
+                      <div class="grid gap-1.5">
+                        <div class="flex h-9 items-center gap-1 rounded-md border bg-muted/20 p-0.5">
+                          <Button type="button" size="sm" class="h-8 flex-1" :variant="nacosAuthKind === 'none' ? 'default' : 'ghost'" @click="nacosAuthKind = 'none'">{{ t("connection.nacosAuthNone") }}</Button>
+                          <Button type="button" size="sm" class="h-8 flex-1" :variant="nacosAuthKind === 'usernamePassword' ? 'default' : 'ghost'" @click="nacosAuthKind = 'usernamePassword'">{{ t("nacos.nacosUsernamePassword") }}</Button>
                         </div>
                       </div>
-                      <div v-if="nacosConsoleAuthKind === 'inherit' && nacosAuthKind === 'none'" class="grid grid-cols-4 items-start gap-4">
-                        <span />
-                        <p class="col-span-3 m-0 text-xs text-destructive">{{ t("connection.nacosConsoleAuthPrimaryNone") }}</p>
+                    </div>
+                    <div v-if="nacosAuthKind === 'usernamePassword'" class="mt-4 grid gap-4 sm:grid-cols-2">
+                      <div class="grid gap-1.5">
+                        <Label>{{ t("connection.user") }}</Label>
+                        <Input v-model="nacosUsername" placeholder="nacos" />
                       </div>
-                      <template v-if="nacosConsoleAuthKind === 'usernamePassword'">
-                        <div class="grid grid-cols-4 items-center gap-4">
-                          <Label :class="connectionLabelClass">{{ t("connection.nacosConsoleUser") }}</Label
-                          ><Input v-model="nacosConsoleUsername" class="col-span-3" />
-                        </div>
-                        <div class="grid grid-cols-4 items-center gap-4">
-                          <Label :class="connectionLabelClass">{{ t("connection.nacosConsolePassword") }}</Label
-                          ><PasswordInput v-model="nacosConsolePassword" class="col-span-3" />
-                        </div>
-                      </template>
-                    </template>
-                  </template>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosAuth") }}</Label>
-                    <div class="col-span-3 flex flex-wrap gap-2">
-                      <Button size="sm" :variant="nacosAuthKind === 'none' ? 'default' : 'outline'" @click="nacosAuthKind = 'none'">{{ t("connection.nacosAuthNone") }}</Button>
-                      <Button size="sm" :variant="nacosAuthKind === 'usernamePassword' ? 'default' : 'outline'" @click="nacosAuthKind = 'usernamePassword'">{{ t("connection.nacosAuthUserPassword") }}</Button>
+                      <div class="grid gap-1.5">
+                        <Label>{{ t("connection.password") }}</Label>
+                        <PasswordInput v-model="nacosPassword" />
+                      </div>
                     </div>
-                  </div>
-                  <template v-if="nacosAuthKind === 'usernamePassword'">
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>
-                      <Input v-model="nacosUsername" class="col-span-3" placeholder="nacos" />
+                  </section>
+
+                  <section data-nacos-advanced-hint class="flex items-start gap-3 rounded-lg border border-dashed bg-muted/20 px-4 py-3">
+                    <CircleHelp class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                    <div class="min-w-0 flex-1">
+                      <div class="text-sm font-medium">{{ t("nacos.nacosAdvancedHint") }}</div>
+                      <p class="mt-0.5 text-xs leading-5 text-muted-foreground">{{ t("nacos.nacosAdvancedHintDescription") }}</p>
                     </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ t("connection.password") }}</Label>
-                      <PasswordInput v-model="nacosPassword" class="col-span-3" />
-                    </div>
-                  </template>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelSmallClass">{{ t("connection.nacosTls") }}</Label>
-                    <label class="col-span-3 inline-flex items-center gap-2">
-                      <input type="checkbox" v-model="nacosTlsSkipVerify" class="mr-0" />
-                      <span class="text-xs text-muted-foreground">{{ t("connection.nacosTlsSkipVerify") }}</span>
-                    </label>
-                  </div>
-                  <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">{{ t("connection.nacosPageSize") }}</Label>
-                    <Input v-model.number="nacosPageSize" type="number" min="1" max="500" class="col-span-3" />
-                  </div>
+                    <Button type="button" variant="outline" size="sm" class="shrink-0" @click="configTab = 'advanced'">{{ t("nacos.nacosGoAdvanced") }}</Button>
+                  </section>
                 </template>
 
                 <!-- Redis: host, port, user, password, ssl -->
@@ -6674,7 +6623,7 @@ function openExternalUrl(url: string) {
             </TabsContent>
 
             <TabsContent v-if="supportsTlsToggle" value="tls" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
-              <div class="connection-form-body grid min-h-0 flex-1 gap-4 overflow-y-auto overflow-x-hidden pt-4 pr-2">
+              <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto overflow-x-hidden pt-4 pr-2 pb-6">
                 <div v-if="!supportsPostgresTlsOptions && !supportsMysqlTlsOptions" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">SSL/TLS</Label>
                   <label class="col-span-3 flex items-center gap-2 cursor-pointer">
@@ -6974,7 +6923,101 @@ function openExternalUrl(url: string) {
             </TabsContent>
 
             <TabsContent value="advanced" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
-              <div class="connection-form-body grid min-h-0 flex-1 gap-4 overflow-y-auto pt-4 pr-2">
+              <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto pt-4 pr-2 pb-6">
+                <section v-if="form.db_type === 'nacos'" data-nacos-advanced-settings class="overflow-hidden rounded-lg border">
+                  <div class="border-b bg-muted/20 px-4 py-3">
+                    <div class="text-sm font-medium">{{ t("nacos.nacosAdvancedTitle") }}</div>
+                    <p class="mt-0.5 text-xs leading-5 text-muted-foreground">{{ t("nacos.nacosAdvancedDescription") }}</p>
+                  </div>
+                  <div class="grid gap-5 p-4">
+                    <div class="grid gap-1.5">
+                      <Label>{{ t("connection.nacosPageSize") }}</Label>
+                      <Input v-model.number="nacosPageSize" type="number" min="1" max="500" />
+                      <p class="text-[11px] leading-4 text-muted-foreground">{{ t("nacos.nacosPageSizeHint") }}</p>
+                    </div>
+
+                    <div class="grid gap-2 border-t pt-4">
+                      <div class="grid gap-1.5 sm:grid-cols-[minmax(0,1fr)_180px] sm:items-center">
+                        <div>
+                          <Label>{{ t("connection.nacosMetrics") }}</Label>
+                          <p class="mt-1 text-[11px] leading-4 text-muted-foreground">{{ t("nacos.nacosMetricsHint") }}</p>
+                        </div>
+                        <Select v-model="nacosMetricsMode">
+                          <SelectTrigger class="h-9">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="auto">{{ t("connection.nacosMetricsAuto") }}</SelectItem>
+                            <SelectItem value="disabled">{{ t("connection.nacosMetricsDisabled") }}</SelectItem>
+                            <SelectItem value="custom">{{ t("connection.nacosMetricsCustom") }}</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div v-if="nacosMetricsMode === 'custom'" class="grid gap-1.5">
+                        <Label>{{ t("connection.nacosMetricsUrl") }}</Label>
+                        <Input v-model="nacosMetricsUrl" :aria-invalid="!!nacosMetricsUrlError" :class="{ 'border-destructive focus-visible:ring-destructive': nacosMetricsUrlError }" placeholder="http://127.0.0.1:8848/nacos/actuator/prometheus" />
+                        <p v-if="nacosMetricsUrlError" class="text-xs text-destructive">{{ nacosMetricsUrlError }}</p>
+                      </div>
+                    </div>
+
+                    <div v-if="nacosImplementation === 'rnacos'" class="grid gap-4 border-t pt-4">
+                      <div class="flex items-start justify-between gap-4">
+                        <div>
+                          <Label>{{ t("nacos.nacosRnacosExtension") }}</Label>
+                          <p class="mt-1 text-[11px] leading-4 text-muted-foreground">{{ t("nacos.nacosRnacosExtensionHint") }}</p>
+                        </div>
+                        <label class="inline-flex shrink-0 items-center gap-2">
+                          <Switch v-model="nacosHistoryEnabled" />
+                          <span class="text-xs text-muted-foreground">{{ t("nacos.nacosEnabled") }}</span>
+                        </label>
+                      </div>
+                      <template v-if="nacosHistoryEnabled">
+                        <div class="grid gap-1.5">
+                          <Label>{{ t("connection.nacosRNacosConsoleUrl") }}</Label>
+                          <Input v-model="nacosRNacosConsoleAddr" :placeholder="t('connection.nacosRNacosConsoleUrlPlaceholder')" />
+                          <p class="text-[11px] leading-4 text-muted-foreground">{{ t("nacos.nacosRnacosConsoleUrlHint") }}</p>
+                        </div>
+                        <template v-if="nacosRNacosConsoleAddr.trim()">
+                          <div class="grid gap-1.5">
+                            <Label>{{ t("connection.nacosConsoleAuthentication") }}</Label>
+                            <div class="flex items-center gap-1 rounded-md border bg-muted/20 p-0.5">
+                              <Button type="button" size="sm" class="h-8 flex-1" :variant="nacosConsoleAuthKind === 'inherit' ? 'default' : 'ghost'" :disabled="nacosAuthKind === 'none'" @click="nacosConsoleAuthKind = 'inherit'">
+                                {{ t("connection.nacosConsoleAuthInherit") }}
+                              </Button>
+                              <Button type="button" size="sm" class="h-8 flex-1" :variant="nacosConsoleAuthKind === 'usernamePassword' ? 'default' : 'ghost'" @click="nacosConsoleAuthKind = 'usernamePassword'">
+                                {{ t("connection.nacosConsoleAuthSeparate") }}
+                              </Button>
+                            </div>
+                            <p v-if="nacosConsoleAuthKind === 'inherit' && nacosAuthKind === 'none'" class="text-xs text-destructive">{{ t("connection.nacosConsoleAuthPrimaryNone") }}</p>
+                          </div>
+                          <div v-if="nacosConsoleAuthKind === 'usernamePassword'" class="grid gap-4 sm:grid-cols-2">
+                            <div class="grid gap-1.5">
+                              <Label>{{ t("connection.nacosConsoleUser") }}</Label>
+                              <Input v-model="nacosConsoleUsername" />
+                            </div>
+                            <div class="grid gap-1.5">
+                              <Label>{{ t("connection.nacosConsolePassword") }}</Label>
+                              <PasswordInput v-model="nacosConsolePassword" />
+                            </div>
+                          </div>
+                        </template>
+                      </template>
+                      <p v-else class="text-[11px] leading-4 text-muted-foreground">{{ t("nacos.nacosRnacosDisabledHint") }}</p>
+                    </div>
+
+                    <label class="flex items-start justify-between gap-4 border-t pt-4">
+                      <div>
+                        <div class="text-sm font-medium">{{ t("connection.nacosTls") }}</div>
+                        <p class="mt-1 text-[11px] leading-4 text-muted-foreground">{{ t("nacos.nacosTlsHint") }}</p>
+                      </div>
+                      <span class="inline-flex shrink-0 items-center gap-2">
+                        <input v-model="nacosTlsSkipVerify" type="checkbox" class="mr-0" />
+                        <span class="text-xs text-muted-foreground">{{ t("connection.nacosTlsSkipVerify") }}</span>
+                      </span>
+                    </label>
+                  </div>
+                </section>
+
                 <div v-if="showGaussdbConnectionMode" class="grid grid-cols-4 items-start gap-4">
                   <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.gaussdbConnectionMode") }}</Label>
                   <div class="col-span-3 grid gap-1">
@@ -7131,7 +7174,7 @@ function openExternalUrl(url: string) {
             </TabsContent>
 
             <TabsContent v-if="canUseTransportLayers" value="transport" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
-              <div class="connection-form-body grid min-h-0 flex-1 gap-4 overflow-y-auto overflow-x-hidden pt-4 pr-2">
+              <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto overflow-x-hidden pt-4 pr-2 pb-6">
                 <div class="connection-label-wide-grid grid min-w-0 grid-cols-4 items-start gap-4">
                   <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.sshHops") }}</Label>
                   <div class="col-span-3 grid min-w-0 gap-3">
@@ -7397,7 +7440,12 @@ function openExternalUrl(url: string) {
               </Button>
             </template>
           </div>
-          <Button v-if="canChooseVisibleDatabases" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleDatabases || !hasRequiredConnectionTarget" @click="openVisibleDatabasesPicker">
+          <Button v-if="canChooseVisibleNacosNamespaces" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleNacosNamespaces || !hasRequiredConnectionTarget" @click="openVisibleNacosNamespacesPicker">
+            <Loader2 v-if="isLoadingVisibleNacosNamespaces" class="mr-1.5 h-4 w-4 animate-spin" />
+            <ListFilter v-else class="mr-1.5 h-4 w-4" />
+            {{ t("nacos.nacosVisibleNamespacesTitle") }}
+          </Button>
+          <Button v-else-if="canChooseVisibleDatabases" variant="outline" class="shrink-0" :disabled="isTesting || isSaving || isLoadingVisibleDatabases || !hasRequiredConnectionTarget" @click="openVisibleDatabasesPicker">
             <Loader2 v-if="isLoadingVisibleDatabases" class="mr-1.5 h-4 w-4 animate-spin" />
             <ListFilter v-else class="mr-1.5 h-4 w-4" />
             {{ hasVisibleObjectFilter ? visibleObjectSummary : visibleFilterUsesSchemas ? t("contextMenu.configureVisibleObjects") : t("contextMenu.selectVisibleDatabases") }}
@@ -7477,6 +7525,58 @@ function openExternalUrl(url: string) {
           {{ t("connection.copyError") }}
         </Button>
         <Button @click="showConnectionErrorDialog = false">{{ t("common.close") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showVisibleNacosNamespacesDialog">
+    <DialogContent class="sm:max-w-[460px]" @interact-outside.prevent @escape-key-down.prevent>
+      <DialogHeader>
+        <DialogTitle>{{ t("nacos.nacosVisibleNamespacesTitle") }}</DialogTitle>
+        <p class="text-sm text-muted-foreground">{{ t("nacos.nacosVisibleNamespacesDescription", { name: form.name || selectedProfile().label }) }}</p>
+      </DialogHeader>
+
+      <div class="flex items-center gap-2 rounded-md border bg-background px-2">
+        <Search class="h-4 w-4 shrink-0 text-muted-foreground" />
+        <Input v-model="visibleNacosNamespaceSearchText" :placeholder="t('nacos.nacosSearchNamespaces')" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoadingVisibleNacosNamespaces || !!visibleNacosNamespaceError" />
+      </div>
+
+      <div class="flex items-center justify-between text-xs text-muted-foreground">
+        <span>{{ t("nacos.nacosSelectedNamespaces", { selected: visibleNacosNamespaceSelectedCount, total: visibleNacosNamespaces.length }) }}</span>
+        <div class="flex items-center gap-2">
+          <button class="hover:text-foreground disabled:opacity-50" :disabled="isLoadingVisibleNacosNamespaces" @click="selectAllVisibleNacosNamespaces">{{ t("nacos.nacosSelectAll") }}</button>
+          <button class="hover:text-foreground disabled:opacity-50" :disabled="isLoadingVisibleNacosNamespaces" @click="clearVisibleNacosNamespaceSelection">{{ t("nacos.nacosClearSelection") }}</button>
+          <button class="hover:text-foreground disabled:opacity-50" :disabled="isLoadingVisibleNacosNamespaces" @click="showAllVisibleNacosNamespaces">{{ t("nacos.nacosShowAll") }}</button>
+        </div>
+      </div>
+      <p v-if="!isLoadingVisibleNacosNamespaces && !visibleNacosNamespaceError && !visibleNacosNamespaceCanSave" class="text-xs text-destructive">{{ t("nacos.nacosNamespaceSelectionRequired") }}</p>
+
+      <div class="h-72 overflow-y-auto rounded-md border bg-background/50 p-1">
+        <div v-if="isLoadingVisibleNacosNamespaces" class="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+          <Loader2 class="h-4 w-4 animate-spin" />
+          {{ t("common.loading") }}
+        </div>
+        <div v-else-if="visibleNacosNamespaceError" class="p-3 text-sm text-destructive">{{ t("nacos.nacosLoadNamespacesFailed", { message: visibleNacosNamespaceError }) }}</div>
+        <div v-else-if="!filteredVisibleNacosNamespaces.length" class="p-3 text-sm text-muted-foreground">{{ t("grid.noSearchResults") }}</div>
+        <template v-else>
+          <button
+            v-for="namespace in filteredVisibleNacosNamespaces"
+            :key="nacosNamespaceValue(namespace) || '__public__'"
+            type="button"
+            class="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+            @click="toggleVisibleNacosNamespace(nacosNamespaceValue(namespace))"
+          >
+            <CheckSquare v-if="visibleNacosNamespaceSelection.has(nacosNamespaceValue(namespace))" class="h-4 w-4 shrink-0 text-primary" />
+            <Square v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span class="min-w-0 flex-1 truncate">{{ nacosNamespaceLabel(namespace) }}</span>
+            <span v-if="namespace.namespace && namespace.namespace !== nacosNamespaceLabel(namespace)" class="shrink-0 truncate text-xs text-muted-foreground">{{ namespace.namespace }}</span>
+          </button>
+        </template>
+      </div>
+
+      <DialogFooter>
+        <Button variant="outline" @click="showVisibleNacosNamespacesDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="isLoadingVisibleNacosNamespaces || !!visibleNacosNamespaceError || !visibleNacosNamespaceCanSave" @click="saveVisibleNacosNamespaceSelection">{{ t("nacos.save") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>
@@ -7654,15 +7754,22 @@ function openExternalUrl(url: string) {
   min-height: 0;
 }
 
+.connection-dialog-content--config .connection-form-body {
+  /* Preserve every form section's natural height; the form viewport owns
+   * scrolling and must never shrink cards into collapsed grid rows. */
+  align-content: start;
+}
+
+.connection-form-body--nacos {
+  /* Authentication fields are conditional. Keep every Nacos card at its
+   * max-content height when they appear, and scroll the form as a whole. */
+  grid-auto-rows: max-content;
+}
+
 @media (max-height: 720px) {
   .connection-dialog-content--config {
     /* A definite flex height lets tab bodies shrink and scroll above the fixed footer. */
     height: calc(var(--dbx-viewport-height) - 2rem);
-  }
-
-  .connection-dialog-content--config .connection-form-body {
-    /* Keep grid rows compact when the scroll viewport is taller than the form. */
-    align-content: start;
   }
 }
 
