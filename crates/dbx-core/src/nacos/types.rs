@@ -184,6 +184,10 @@ pub struct NacosConfigQuery {
     pub namespace: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// Applies case-insensitive contains matching to `group` after listing.
+    /// Defaults to exact server-side filtering for internal callers.
+    #[serde(default)]
+    pub group_contains: bool,
     #[serde(default)]
     pub data_id: Option<String>,
     #[serde(default)]

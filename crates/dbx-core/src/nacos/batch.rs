@@ -196,6 +196,7 @@ async fn resolve_selector(
             let mut query = selector.query.clone().unwrap_or(crate::nacos::types::NacosConfigQuery {
                 namespace: None,
                 group: None,
+                group_contains: false,
                 data_id: None,
                 app_name: None,
                 search: None,
@@ -397,6 +398,7 @@ async fn existing_config(
         .list_configs(crate::nacos::types::NacosConfigQuery {
             namespace: Some(namespace.clone()),
             group: Some(config.group.clone()),
+            group_contains: false,
             data_id: Some(config.data_id.clone()),
             app_name: None,
             search: None,

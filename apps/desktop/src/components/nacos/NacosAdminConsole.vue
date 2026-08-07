@@ -178,6 +178,7 @@ const importSourceName = ref("");
 const configEditorTheme = new Compartment();
 const configEditorFontTheme = new Compartment();
 const configEditorLanguage = new Compartment();
+const configListRequestGuard = createNacosLatestRequestGuard();
 const configDetailRequestGuard = createNacosLatestRequestGuard();
 let configEditorGeneration = 0;
 let configEditorSessionId = 0;
@@ -389,6 +390,7 @@ function buildConfigSelector(scope: NacosConfigSelectionScope): NacosConfigSelec
         ? {
             namespace: namespace.value || undefined,
             group: configGroup.value.trim() || undefined,
+            groupContains: true,
             dataId: configDataId.value.trim() || undefined,
             appName: configAppName.value.trim() || undefined,
           }
@@ -656,34 +658,67 @@ async function loadInfo() {
   }
 }
 
-async function loadConfigs(page = configPageNo.value) {
+async function loadConfigs(page = configPageNo.value): Promise<boolean> {
+  const requestId = configListRequestGuard.begin();
+  const connectionId = props.connectionId;
+  const requestNamespace = namespace.value;
+  const requestGroup = configGroup.value.trim();
+  const requestDataId = configDataId.value.trim();
+  const requestAppName = configAppName.value.trim();
+  const requestPageSize = configPageSize.value;
+  const isCurrentRequest = () =>
+    configListRequestGuard.isCurrent(requestId) &&
+    connectionId === props.connectionId &&
+    requestNamespace === namespace.value &&
+    requestGroup === configGroup.value.trim() &&
+    requestDataId === configDataId.value.trim() &&
+    requestAppName === configAppName.value.trim() &&
+    requestPageSize === configPageSize.value;
   configLoading.value = true;
   configError.value = "";
   configPageNo.value = page;
   try {
-    const result = await api.nacosListConfigs(props.connectionId, {
-      namespace: namespace.value || undefined,
-      group: configGroup.value.trim() || undefined,
-      dataId: configDataId.value.trim() || undefined,
-      appName: configAppName.value.trim() || undefined,
-      pageNo: configPageNo.value,
-      pageSize: configPageSize.value,
+    const result = await api.nacosListConfigs(connectionId, {
+      namespace: requestNamespace || undefined,
+      group: requestGroup || undefined,
+      groupContains: true,
+      dataId: requestDataId || undefined,
+      appName: requestAppName || undefined,
+      pageNo: page,
+      pageSize: requestPageSize,
     });
+    if (!isCurrentRequest()) return false;
     configs.value = applyKnownConfigFormats(result.items.map(normalizeConfigItemFormat));
     configTotal.value = result.totalCount;
+    return true;
   } catch (error) {
-    await handleRNacosConsoleError(error, () => loadConfigs(page), "config");
+    if (!isCurrentRequest()) return false;
+    await handleRNacosConsoleError(
+      error,
+      async () => {
+        await loadConfigs(page);
+      },
+      "config",
+    );
+    return true;
   } finally {
-    configLoading.value = false;
+    if (configListRequestGuard.isCurrent(requestId)) configLoading.value = false;
   }
 }
 
 async function loadConfigsWithRetry(page = configPageNo.value) {
   for (let attempt = 0; ; attempt += 1) {
-    await loadConfigs(page);
-    if (!isConnectionNotFoundError(configError.value) || attempt >= CONNECTION_NOT_FOUND_RETRY_DELAYS_MS.length) return;
+    const current = await loadConfigs(page);
+    if (!current || !isConnectionNotFoundError(configError.value) || attempt >= CONNECTION_NOT_FOUND_RETRY_DELAYS_MS.length) return;
     await delay(CONNECTION_NOT_FOUND_RETRY_DELAYS_MS[attempt]);
   }
+}
+
+function clearConfigFilter(filter: "dataId" | "group" | "appName") {
+  if (filter === "dataId") configDataId.value = "";
+  else if (filter === "group") configGroup.value = "";
+  else configAppName.value = "";
+  void loadConfigsWithRetry(1);
 }
 
 function closePendingConfigMutationConfirmations() {
@@ -1552,6 +1587,12 @@ async function loadServicesWithRetry(page = servicePageNo.value) {
   }
 }
 
+function clearServiceFilter(filter: "name" | "group") {
+  if (filter === "name") serviceName.value = "";
+  else serviceGroup.value = "";
+  void loadServicesWithRetry(1);
+}
+
 async function selectService(service: NacosServiceInfo) {
   serviceMutationSequence += 1;
   instanceUpdateSequence += 1;
@@ -2092,6 +2133,7 @@ watch(
   () => [props.connectionId, props.namespace] as const,
   async () => {
     closePendingConfigMutationConfirmations();
+    configListRequestGuard.invalidate();
     configDetailRequestGuard.invalidate();
     configEditorSessionId += 1;
     latestConfigSaveRequestId += 1;
@@ -2141,6 +2183,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  configListRequestGuard.invalidate();
   configDetailRequestGuard.invalidate();
   servicesRequestGuard.invalidate();
   serviceDetailRequestGuard.invalidate();
@@ -2210,9 +2253,45 @@ onBeforeUnmount(() => {
       <Pane :size="nacosSplitSize" min-size="24">
         <div class="flex h-full min-h-0 flex-col">
           <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto_auto] gap-2 border-b p-2">
-            <Input v-model="configDataId" class="h-8 min-w-0" placeholder="dataId" @keyup.enter="loadConfigsWithRetry(1)" />
-            <Input v-model="configGroup" class="h-8 min-w-0" :placeholder="t('nacos.allGroups')" @keyup.enter="loadConfigsWithRetry(1)" />
-            <Input v-model="configAppName" class="h-8 min-w-0" :placeholder="t('nacos.application')" @keyup.enter="loadConfigsWithRetry(1)" />
+            <div class="relative min-w-0">
+              <Input v-model="configDataId" class="h-8 min-w-0 pr-8" placeholder="dataId" @keyup.enter="loadConfigsWithRetry(1)" />
+              <button
+                v-if="configDataId"
+                type="button"
+                class="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                :title="t('nacos.clear')"
+                :aria-label="t('nacos.clear')"
+                @click="clearConfigFilter('dataId')"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div class="relative min-w-0">
+              <Input v-model="configGroup" class="h-8 min-w-0 pr-8" :placeholder="t('nacos.allGroups')" @keyup.enter="loadConfigsWithRetry(1)" />
+              <button
+                v-if="configGroup"
+                type="button"
+                class="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                :title="t('nacos.clear')"
+                :aria-label="t('nacos.clear')"
+                @click="clearConfigFilter('group')"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div class="relative min-w-0">
+              <Input v-model="configAppName" class="h-8 min-w-0 pr-8" :placeholder="t('nacos.application')" @keyup.enter="loadConfigsWithRetry(1)" />
+              <button
+                v-if="configAppName"
+                type="button"
+                class="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                :title="t('nacos.clear')"
+                :aria-label="t('nacos.clear')"
+                @click="clearConfigFilter('appName')"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
             <Button size="sm" variant="outline" class="h-8 w-9 px-0" :title="t('nacos.load')" :disabled="configLoading" @click="loadConfigsWithRetry(1)">
               <Loader2 v-if="configLoading" class="h-3.5 w-3.5 animate-spin" />
               <RefreshCw v-else class="h-3.5 w-3.5" />
@@ -2471,8 +2550,32 @@ onBeforeUnmount(() => {
       <Pane :size="nacosSplitSize" min-size="24">
         <div class="flex h-full min-h-0 flex-col">
           <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto] gap-2 border-b p-2">
-            <Input v-model="serviceName" class="h-8 min-w-0" :placeholder="t('nacos.service')" @keyup.enter="loadServicesWithRetry(1)" />
-            <Input v-model="serviceGroup" class="h-8 min-w-0" :placeholder="t('nacos.allGroups')" @keyup.enter="loadServicesWithRetry(1)" />
+            <div class="relative min-w-0">
+              <Input v-model="serviceName" class="h-8 min-w-0 pr-8" :placeholder="t('nacos.service')" @keyup.enter="loadServicesWithRetry(1)" />
+              <button
+                v-if="serviceName"
+                type="button"
+                class="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                :title="t('nacos.clear')"
+                :aria-label="t('nacos.clear')"
+                @click="clearServiceFilter('name')"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div class="relative min-w-0">
+              <Input v-model="serviceGroup" class="h-8 min-w-0 pr-8" :placeholder="t('nacos.allGroups')" @keyup.enter="loadServicesWithRetry(1)" />
+              <button
+                v-if="serviceGroup"
+                type="button"
+                class="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                :title="t('nacos.clear')"
+                :aria-label="t('nacos.clear')"
+                @click="clearServiceFilter('group')"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
             <Button size="sm" variant="outline" class="h-8 gap-1.5" :disabled="readOnly || !createServiceCapability.supported" :title="readOnly || !createServiceCapability.supported ? capabilityReason(createServiceCapability) : undefined" @click="openCreateService">
               <Plus class="h-3.5 w-3.5" />
               {{ t("nacos.service") }}
@@ -2642,7 +2745,7 @@ onBeforeUnmount(() => {
                     <div class="flex flex-wrap items-center gap-2">
                       <span class="font-mono text-sm font-medium">{{ instance.ip }}:{{ instance.port }}</span>
                       <Badge variant="outline">{{ instance.clusterName || "DEFAULT" }}</Badge>
-                      <Badge :variant="instance.healthy === false ? 'outline' : 'secondary'" :class="instance.healthy === false ? 'border-destructive/50 text-destructive' : ''">{{ instance.healthy === false ? t("nacos.unhealthy") : t("nacos.healthy") }}</Badge>
+                      <Badge variant="outline" :class="instance.healthy === false ? 'border-destructive/50 text-destructive' : 'border-emerald-500/50 text-emerald-700 dark:text-emerald-300'">{{ instance.healthy === false ? t("nacos.unhealthy") : t("nacos.healthy") }}</Badge>
                       <Badge :variant="instance.enabled === false ? 'outline' : 'secondary'" :class="instance.enabled === false ? 'border-muted-foreground/50 text-muted-foreground' : ''">{{ instance.enabled === false ? t("nacos.offline") : t("nacos.enabled") }}</Badge>
                       <Badge v-if="instance.ephemeral != null" variant="outline">{{ instance.ephemeral ? t("nacos.ephemeral") : t("nacos.persistent") }}</Badge>
                     </div>

@@ -95,6 +95,7 @@ export interface NacosAdminConfig {
 export interface NacosConfigQuery {
   namespace?: string;
   group?: string;
+  groupContains?: boolean;
   dataId?: string;
   appName?: string;
   search?: string;

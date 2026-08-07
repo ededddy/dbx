@@ -319,6 +319,7 @@ where
             .list_configs(NacosConfigQuery {
                 namespace: Some(namespace.to_string()),
                 group: request.group.clone(),
+                group_contains: false,
                 data_id: None,
                 app_name: None,
                 search: None,
