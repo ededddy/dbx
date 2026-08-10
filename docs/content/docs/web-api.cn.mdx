@@ -37,26 +37,31 @@ GET /api/auth/check
 {
   "authenticated": false,
   "required": true,
-  "setup_required": false
+  "setup_required": false,
+  "username": "admin"
 }
 ```
 
 | 字段 | 含义 |
 | --- | --- |
 | `required` | 已启用密码保护 |
-| `setup_required` | 仍需首次设置密码 |
+| `setup_required` | 仍需首次创建账号 |
 | `authenticated` | 当前请求已持有有效会话 |
+| `username` | 已登录的账号名，仅在已认证时返回 |
 
-### 首次设置密码
+### 首次设置账号
 
 ```http
 POST /api/auth/setup
 Content-Type: application/json
 
 {
+  "username": "admin",
   "password": "your-password"
 }
 ```
+
+首次设置会创建第一个用户账号，仅在尚无任何账号时可用。
 
 ### 登录
 
@@ -65,9 +70,12 @@ POST /api/auth/login
 Content-Type: application/json
 
 {
+  "username": "admin",
   "password": "your-password"
 }
 ```
+
+`username` 可省略，默认为 `admin`，因此旧的仅携带密码的客户端仍然可用。
 
 登录成功后，响应会返回 `Set-Cookie: dbx_session=...`。后续请求带上这个 Cookie 即可。
 
@@ -80,11 +88,55 @@ POST /api/auth/logout
 Cookie: dbx_session=...
 ```
 
+### 用户管理
+
+任何已登录会话都可以管理用户账号。通过 `DBX_PASSWORD`/`DBX_USERNAME` 环境变量配置的账号会以 `managedByEnv: true` 列出，无法通过 API 修改。
+
+```http
+GET /api/auth/users
+Cookie: dbx_session=...
+```
+
+```json
+[
+  { "id": 1, "username": "admin", "createdAt": 1754800000000, "managedByEnv": false }
+]
+```
+
+```http
+POST /api/auth/users
+Content-Type: application/json
+Cookie: dbx_session=...
+
+{
+  "username": "alice",
+  "password": "her-password"
+}
+```
+
+```http
+POST /api/auth/users/{id}/password
+Content-Type: application/json
+Cookie: dbx_session=...
+
+{
+  "password": "new-password"
+}
+```
+
+```http
+DELETE /api/auth/users/{id}
+Cookie: dbx_session=...
+```
+
+删除当前登录账号或最后一个账号会被拒绝。
+
 ### 环境变量
 
 | 变量 | 作用 |
 | --- | --- |
-| `DBX_PASSWORD` | 容器启动时设置初始密码 |
+| `DBX_PASSWORD` | 容器启动时预配置登录账号（密码） |
+| `DBX_USERNAME` | `DBX_PASSWORD` 账号的用户名，默认为 `admin` |
 | `DBX_DISABLE_PASSWORD=1` | 完全关闭密码保护 |
 | `DBX_PORT` | 修改监听端口，默认 `4224` |
 | `DBX_DATA_DIR` | 存放 `dbx.db` 的数据目录 |

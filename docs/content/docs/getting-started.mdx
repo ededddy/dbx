@@ -94,11 +94,14 @@ This guide gets you through three things:
 
     | Variable | Default | Purpose |
     | --- | --- | --- |
-    | `DBX_PASSWORD` | Not set | Web login password; recommended for production |
+    | `DBX_PASSWORD` | Not set | Password of the pre-configured web login account; recommended for production |
+    | `DBX_USERNAME` | `admin` | Username of the pre-configured account (used with `DBX_PASSWORD`) |
     | `DBX_DISABLE_PASSWORD` | `false` | Set to `true` or `1` to disable login protection |
     | `DBX_DATA_DIR` | `/app/data` | Persistent data directory |
     | `DBX_PORT` | `4224` | Container listen port |
     | `DBX_PUBLIC_BASE_PATH` | `/` | Deploy below a subpath, such as `/dbx` |
+
+    Without `DBX_PASSWORD`, the first visit shows a setup page that creates the initial username and password. Signed-in users can create and manage additional accounts under **Settings → Security**.
 
     Then open `http://localhost:4224`.
 

@@ -5,7 +5,7 @@ mod sse;
 mod ssh_prompt;
 mod state;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -338,14 +338,41 @@ async fn main() {
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
 
-    let password_hash = if password_disabled {
-        None
-    } else if let Ok(pw) = std::env::var("DBX_PASSWORD") {
-        let salt = SaltString::generate(&mut OsRng);
-        Some(Argon2::default().hash_password(pw.as_bytes(), &salt).expect("Failed to hash password").to_string())
-    } else {
-        app_state.storage.load_password_hash().await.unwrap_or(None)
-    };
+    // Host-provided account via env (username defaults to "admin"). Hashed in
+    // memory at boot and never persisted — same semantics as the legacy
+    // DBX_PASSWORD-only mode.
+    let mut bootstrap_users = HashMap::new();
+    if !password_disabled {
+        if let Ok(pw) = std::env::var("DBX_PASSWORD") {
+            let username = std::env::var("DBX_USERNAME")
+                .ok()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "admin".to_string());
+            let salt = SaltString::generate(&mut OsRng);
+            let hash =
+                Argon2::default().hash_password(pw.as_bytes(), &salt).expect("Failed to hash password").to_string();
+            bootstrap_users.insert(username, hash);
+        }
+    }
+
+    // One-time migration: seed an "admin" user from the legacy single-password
+    // hash stored in app_settings so existing installs keep their password.
+    if bootstrap_users.is_empty() && !password_disabled {
+        match app_state.storage.count_users().await {
+            Ok(0) => {
+                if let Ok(Some(hash)) = app_state.storage.load_password_hash().await {
+                    match app_state.storage.create_user("admin", &hash).await {
+                        Ok(_) => log::info!("Migrated legacy web password to the 'admin' user account"),
+                        Err(e) => log::error!("Failed to migrate legacy web password: {e}"),
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => log::error!("Failed to count web users: {e}"),
+        }
+    }
+    let has_db_users = app_state.storage.count_users().await.unwrap_or(0) > 0;
 
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
@@ -354,8 +381,9 @@ async fn main() {
         data_dir,
         public_base_path: public_base_path.clone(),
         password_disabled,
-        password_hash: RwLock::new(password_hash),
-        sessions: RwLock::new(HashSet::new()),
+        bootstrap_users,
+        has_db_users: RwLock::new(has_db_users),
+        sessions: RwLock::new(HashMap::new()),
         sse_channels: RwLock::new(HashMap::new()),
         transfer_progress_channels: RwLock::new(HashMap::new()),
         table_import_channels: RwLock::new(HashMap::new()),
@@ -376,6 +404,9 @@ async fn main() {
         .route("/auth/setup", post(auth::setup))
         .route("/auth/change-password", post(auth::change_password))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/users", get(auth::list_users).post(auth::create_user))
+        .route("/auth/users/{id}", delete(auth::delete_user))
+        .route("/auth/users/{id}/password", post(auth::reset_user_password))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))

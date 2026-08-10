@@ -37,15 +37,17 @@ Example response:
 {
   "authenticated": false,
   "required": true,
-  "setup_required": false
+  "setup_required": false,
+  "username": "admin"
 }
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `required` | Password protection is enabled |
-| `setup_required` | First-run password setup is still needed |
+| `setup_required` | First-run account setup is still needed |
 | `authenticated` | Current request already has a valid session |
+| `username` | Signed-in account name, present only when authenticated |
 
 ### First-Run Setup
 
@@ -54,9 +56,12 @@ POST /api/auth/setup
 Content-Type: application/json
 
 {
+  "username": "admin",
   "password": "your-password"
 }
 ```
+
+Setup creates the first user account and is only accepted while no account exists.
 
 ### Login
 
@@ -65,9 +70,12 @@ POST /api/auth/login
 Content-Type: application/json
 
 {
+  "username": "admin",
   "password": "your-password"
 }
 ```
+
+`username` is optional and defaults to `admin`, which keeps older password-only clients working.
 
 On success, the response sets `Set-Cookie: dbx_session=...`. Reuse that cookie on later requests.
 
@@ -80,11 +88,55 @@ POST /api/auth/logout
 Cookie: dbx_session=...
 ```
 
+### User Management
+
+Any authenticated session can manage user accounts. Accounts created from the `DBX_PASSWORD`/`DBX_USERNAME` environment variables are listed with `managedByEnv: true` and cannot be modified through the API.
+
+```http
+GET /api/auth/users
+Cookie: dbx_session=...
+```
+
+```json
+[
+  { "id": 1, "username": "admin", "createdAt": 1754800000000, "managedByEnv": false }
+]
+```
+
+```http
+POST /api/auth/users
+Content-Type: application/json
+Cookie: dbx_session=...
+
+{
+  "username": "alice",
+  "password": "her-password"
+}
+```
+
+```http
+POST /api/auth/users/{id}/password
+Content-Type: application/json
+Cookie: dbx_session=...
+
+{
+  "password": "new-password"
+}
+```
+
+```http
+DELETE /api/auth/users/{id}
+Cookie: dbx_session=...
+```
+
+Deleting your own account or the last remaining account is rejected.
+
 ### Environment Variables
 
 | Variable | Purpose |
 | --- | --- |
-| `DBX_PASSWORD` | Set an initial password at container startup |
+| `DBX_PASSWORD` | Pre-configure a login account at container startup (password) |
+| `DBX_USERNAME` | Username for the `DBX_PASSWORD` account; defaults to `admin` |
 | `DBX_DISABLE_PASSWORD=1` | Disable password protection entirely |
 | `DBX_PORT` | Change the listen port (default `4224`) |
 | `DBX_DATA_DIR` | Data directory containing `dbx.db` |

@@ -263,7 +263,7 @@ For upgrade compatibility, an existing `DBX_MCP_ALLOW_WRITES=0` (or `false`) rem
 
 Windows portable builds need `DBX_DATA_DIR` in the MCP config, pointing to the `data` directory next to `DBX.exe` (the folder that contains `dbx.db`).
 
-For DBX Web or Docker deployments, point the MCP server at the Web backend API. If the Web login page requires a password, set `DBX_WEB_PASSWORD` to the same password used there:
+For DBX Web or Docker deployments, point the MCP server at the Web backend API. If the Web login page requires a password, set `DBX_WEB_PASSWORD` to the account's password (and `DBX_WEB_USERNAME` when the account name is not `admin`):
 
 ```json
 {

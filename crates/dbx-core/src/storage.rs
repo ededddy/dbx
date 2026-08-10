@@ -569,6 +569,18 @@ fn default_sidebar_table_page_size() -> usize {
     1000
 }
 
+/// A web user account (only used by dbx-web; the desktop app never reads the
+/// `users` table). `created_at`/`updated_at` are unix epoch milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRecord {
+    pub id: i64,
+    pub username: String,
+    pub password_hash: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 pub const DUCKDB_WORKER_MAX_PROCESSES_MIN: usize = 1;
 pub const DUCKDB_WORKER_MAX_PROCESSES_MAX: usize = 16;
 pub const DUCKDB_WORKER_MAX_PROCESSES_DEFAULT: usize = 4;
@@ -802,6 +814,13 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         content TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        password_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
     )",
 ];
 
@@ -2018,6 +2037,96 @@ impl Storage {
     pub async fn load_password_hash(&self) -> Result<Option<String>, String> {
         let settings = self.load_app_settings_json().await?;
         Ok(settings.get("password_hash").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    }
+
+    // Web user accounts (only used by dbx-web; the desktop app never reads this table)
+
+    pub async fn list_users(&self) -> Result<Vec<UserRecord>, String> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT id, username, password_hash, created_at, updated_at FROM users ORDER BY username COLLATE NOCASE")
+                .map_err(|e| e.to_string())?;
+            let users = stmt
+                .query_map([], |row| {
+                    Ok(UserRecord {
+                        id: row.get(0)?,
+                        username: row.get(1)?,
+                        password_hash: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(users)
+        })
+        .await
+    }
+
+    pub async fn count_users(&self) -> Result<i64, String> {
+        self.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0)).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_user_by_username(&self, username: &str) -> Result<Option<UserRecord>, String> {
+        let username = username.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT id, username, password_hash, created_at, updated_at FROM users WHERE username = ?1 COLLATE NOCASE",
+                [username],
+                |row| {
+                    Ok(UserRecord {
+                        id: row.get(0)?,
+                        username: row.get(1)?,
+                        password_hash: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn create_user(&self, username: &str, password_hash: &str) -> Result<i64, String> {
+        let username = username.to_string();
+        let password_hash = password_hash.to_string();
+        self.with_conn(move |conn| {
+            let now = unix_timestamp_millis();
+            conn.execute(
+                "INSERT INTO users (username, password_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+                params![username, password_hash, now],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    pub async fn update_user_password(&self, id: i64, password_hash: &str) -> Result<(), String> {
+        let password_hash = password_hash.to_string();
+        self.with_conn(move |conn| {
+            let now = unix_timestamp_millis();
+            conn.execute(
+                "UPDATE users SET password_hash = ?1, updated_at = ?2 WHERE id = ?3",
+                params![password_hash, now, id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn delete_user(&self, id: i64) -> Result<(), String> {
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM users WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
+        })
+        .await
     }
 
     pub async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicyState, String> {
@@ -8234,6 +8343,57 @@ mod tests {
         assert!(storage.load_snippet_sync_state("github").await.unwrap().pending_cleanup.is_some());
         assert!(storage.clear_snippet_pending_cleanup_if_matches("github", &pending).await.unwrap());
         assert!(storage.load_snippet_sync_state("github").await.unwrap().pending_cleanup.is_none());
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn users_crud_roundtrip() {
+        let db = temp_db_path("users-crud");
+        let storage = Storage::open(&db).await.unwrap();
+
+        assert_eq!(storage.count_users().await.unwrap(), 0);
+        assert!(storage.list_users().await.unwrap().is_empty());
+        assert!(storage.load_user_by_username("admin").await.unwrap().is_none());
+
+        let admin_id = storage.create_user("admin", "hash-1").await.unwrap();
+        let alice_id = storage.create_user("alice", "hash-2").await.unwrap();
+        assert_eq!(storage.count_users().await.unwrap(), 2);
+
+        let admin = storage.load_user_by_username("admin").await.unwrap().unwrap();
+        assert_eq!(admin.id, admin_id);
+        assert_eq!(admin.username, "admin");
+        assert_eq!(admin.password_hash, "hash-1");
+        assert!(admin.created_at > 0);
+        assert_eq!(admin.created_at, admin.updated_at);
+
+        // Username lookup is case-insensitive
+        let admin_upper = storage.load_user_by_username("ADMIN").await.unwrap().unwrap();
+        assert_eq!(admin_upper.id, admin_id);
+
+        let users = storage.list_users().await.unwrap();
+        assert_eq!(users.iter().map(|u| u.username.as_str()).collect::<Vec<_>>(), vec!["admin", "alice"]);
+
+        storage.update_user_password(admin_id, "hash-3").await.unwrap();
+        let admin = storage.load_user_by_username("admin").await.unwrap().unwrap();
+        assert_eq!(admin.password_hash, "hash-3");
+        assert!(admin.updated_at >= admin.created_at);
+
+        storage.delete_user(alice_id).await.unwrap();
+        assert_eq!(storage.count_users().await.unwrap(), 1);
+        assert!(storage.load_user_by_username("alice").await.unwrap().is_none());
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn users_username_unique_case_insensitive() {
+        let db = temp_db_path("users-unique");
+        let storage = Storage::open(&db).await.unwrap();
+
+        storage.create_user("admin", "hash-1").await.unwrap();
+        assert!(storage.create_user("ADMIN", "hash-2").await.is_err());
+        assert_eq!(storage.count_users().await.unwrap(), 1);
 
         std::fs::remove_file(&db).ok();
     }

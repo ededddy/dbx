@@ -1,5 +1,5 @@
 use dbx_core::connection::AppState;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
@@ -32,8 +32,13 @@ pub struct WebState {
     pub data_dir: PathBuf,
     pub public_base_path: String,
     pub password_disabled: bool,
-    pub password_hash: RwLock<Option<String>>,
-    pub sessions: RwLock<HashSet<String>>,
+    /// Host-provided accounts from `DBX_USERNAME`/`DBX_PASSWORD` env vars
+    /// (username -> Argon2 hash). Checked before DB users, never persisted.
+    pub bootstrap_users: HashMap<String, String>,
+    /// Cached "users table is non-empty" flag; kept in sync by auth handlers.
+    pub has_db_users: RwLock<bool>,
+    /// Session token -> username.
+    pub sessions: RwLock<HashMap<String, String>>,
     pub sse_channels: RwLock<HashMap<String, broadcast::Sender<String>>>,
     pub transfer_progress_channels: RwLock<HashMap<String, Arc<TransferProgressChannel>>>,
     pub table_import_channels: RwLock<HashMap<String, watch::Sender<String>>>,
@@ -58,8 +63,9 @@ impl WebState {
             data_dir,
             public_base_path: "/".to_string(),
             password_disabled: false,
-            password_hash: RwLock::new(None),
-            sessions: RwLock::new(HashSet::new()),
+            bootstrap_users: HashMap::new(),
+            has_db_users: RwLock::new(false),
+            sessions: RwLock::new(HashMap::new()),
             sse_channels: RwLock::new(HashMap::new()),
             transfer_progress_channels: RwLock::new(HashMap::new()),
             table_import_channels: RwLock::new(HashMap::new()),
