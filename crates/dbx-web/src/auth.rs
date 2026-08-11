@@ -101,19 +101,18 @@ async fn has_any_account(state: &WebState) -> bool {
 
 /// Resolve the Argon2 hash for a username: env-provided accounts win over DB users.
 async fn resolve_user_hash(state: &WebState, username: &str) -> Option<String> {
-    if let Some(hash) = state.bootstrap_users.get(username) {
+    // Match bootstrap accounts case-insensitively, consistent with DB users
+    // (UNIQUE ... COLLATE NOCASE) and the duplicate check in create_user.
+    if let Some((_, hash)) = state.bootstrap_users.iter().find(|(u, _)| u.eq_ignore_ascii_case(username)) {
         return Some(hash.clone());
-    }
-    // The UNIQUE ... COLLATE NOCASE index keeps bootstrap usernames distinct in
-    // practice; compare case-insensitively here to be safe.
-    if state.bootstrap_users.keys().any(|u| u.eq_ignore_ascii_case(username)) {
-        return None;
     }
     state.app.storage.load_user_by_username(username).await.ok().flatten().map(|u| u.password_hash)
 }
 
 async fn drop_sessions_for_user(state: &WebState, username: &str) {
-    state.sessions.write().await.retain(|_, u| u != username);
+    // Sessions store the username as typed at login, whose casing may differ
+    // from the account name (usernames match case-insensitively).
+    state.sessions.write().await.retain(|_, u| !u.eq_ignore_ascii_case(username));
 }
 
 pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginRequest>) -> Result<Response, StatusCode> {
@@ -234,7 +233,7 @@ pub async fn change_password(
     };
 
     // Env-provided accounts are managed by the host, not through the UI.
-    if state.bootstrap_users.contains_key(&username) {
+    if state.bootstrap_users.keys().any(|u| u.eq_ignore_ascii_case(&username)) {
         return Ok((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "This account's password is managed via environment variables"})),
@@ -629,6 +628,50 @@ mod tests {
         let req = Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::from(body)).unwrap();
         let res = change_password(State(state.clone()), req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn env_bootstrap_user_login_is_case_insensitive() {
+        let (state, dir) = test_state().await;
+        let state = {
+            let mut s = WebState::for_tests(state.app.clone(), dir.clone());
+            s.bootstrap_users.insert("HostAdmin".to_string(), hash_password("envpw").unwrap());
+            Arc::new(s)
+        };
+
+        // Logging in with a different casing works, like DB-backed accounts.
+        let token = login_token(&state, Some("hostadmin"), "envpw").await;
+        assert_eq!(state.sessions.read().await.get(&token).map(String::as_str), Some("hostadmin"));
+
+        // The account is still recognized as env-managed: password changes are rejected.
+        let body = serde_json::to_string(&serde_json::json!({"old_password": "envpw", "new_password": "new"})).unwrap();
+        let req = Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::from(body)).unwrap();
+        let res = change_password(State(state.clone()), req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_user_drops_sessions_regardless_of_login_casing() {
+        let (state, dir) = test_state().await;
+        state.app.storage.create_user("admin", &hash_password("secret").unwrap()).await.unwrap();
+        state.app.storage.create_user("alice", &hash_password("wonderland").unwrap()).await.unwrap();
+        *state.has_db_users.write().await = true;
+        let admin_token = login_token(&state, None, "secret").await;
+
+        // Alice logged in with different casing than her stored username.
+        let alice_token = login_token(&state, Some("ALICE"), "wonderland").await;
+
+        let users = state.app.storage.list_users().await.unwrap();
+        let alice_id = users.iter().find(|u| u.username == "alice").unwrap().id;
+        let req =
+            Request::builder().header("cookie", format!("dbx_session={admin_token}")).body(Body::empty()).unwrap();
+        let res = delete_user(State(state.clone()), Path(alice_id), req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!state.sessions.read().await.contains_key(&alice_token));
 
         std::fs::remove_dir_all(&dir).ok();
     }
