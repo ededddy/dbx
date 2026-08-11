@@ -273,6 +273,7 @@ For DBX Web or Docker deployments, point the MCP server at the Web backend API. 
       "args": ["-y", "@dbx-app/mcp-server"],
       "env": {
         "DBX_WEB_URL": "http://localhost:4224",
+        "DBX_WEB_USERNAME": "your-web-login-username-if-your-username-is-not-admin",
         "DBX_WEB_PASSWORD": "your-web-login-password"
       }
     }
