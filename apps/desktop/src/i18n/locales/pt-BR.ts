@@ -149,6 +149,7 @@ export default withEnglishFallback({
     resetPassword: "Redefinir senha",
     currentUserBadge: "você",
     envManaged: "Gerenciado por variáveis de ambiente",
+    adminBadge: "Admin",
     userCreated: "Usuário criado",
     userDeleted: "Usuário excluído",
     passwordReset: "Senha redefinida",

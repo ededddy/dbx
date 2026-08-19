@@ -47,6 +47,7 @@ Example response:
 | `setup_required` | First-run account setup is still needed |
 | `authenticated` | Current request already has a valid session |
 | `username` | Signed-in account name, present only when authenticated |
+| `is_admin` | Signed-in account may manage user accounts |
 
 ### First-Run Setup
 
@@ -60,7 +61,7 @@ Content-Type: application/json
 }
 ```
 
-Setup creates the first user account and is only accepted while no account exists.
+Setup creates the first user account and is only accepted while no account exists. The first account becomes the admin; accounts created later through user management are regular accounts.
 
 ### Login
 
@@ -89,7 +90,7 @@ Cookie: dbx_session=...
 
 ### User Management
 
-Any authenticated session can manage user accounts. Accounts created from the `DBX_PASSWORD`/`DBX_USERNAME` environment variables are listed with `managedByEnv: true` and cannot be modified through the API.
+Only admin accounts can manage users — the first account created during setup is the admin, and accounts configured via the `DBX_PASSWORD`/`DBX_USERNAME` environment variables always count as admins. Env-provided accounts are listed with `managedByEnv: true` and cannot be modified through the API. Changing a password revokes the account's other sessions; resetting another account's password revokes all of its sessions.
 
 ```http
 GET /api/auth/users
@@ -98,7 +99,7 @@ Cookie: dbx_session=...
 
 ```json
 [
-  { "id": 1, "username": "admin", "createdAt": 1754800000000, "managedByEnv": false }
+  { "id": 1, "username": "admin", "createdAt": 1754800000000, "managedByEnv": false, "isAdmin": true }
 ]
 ```
 

@@ -147,6 +147,7 @@ export default {
     resetPassword: "Reset Password",
     currentUserBadge: "you",
     envManaged: "Managed via environment variables",
+    adminBadge: "Admin",
     userCreated: "User created",
     userDeleted: "User deleted",
     passwordReset: "Password reset",

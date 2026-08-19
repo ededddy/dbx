@@ -72,6 +72,7 @@ export default withEnglishFallback({
     resetPassword: "重置密码",
     currentUserBadge: "当前用户",
     envManaged: "由环境变量管理",
+    adminBadge: "管理员",
     userCreated: "用户已创建",
     userDeleted: "用户已删除",
     passwordReset: "密码已重置",

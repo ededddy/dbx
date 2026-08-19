@@ -3052,6 +3052,7 @@ interface WebUserAccount {
   username: string;
   createdAt?: number;
   managedByEnv: boolean;
+  isAdmin?: boolean;
 }
 
 const webUsers = ref<WebUserAccount[]>([]);
@@ -3059,6 +3060,7 @@ const webUsersLoading = ref(false);
 const webUsersMessage = ref("");
 const webUsersError = ref(false);
 const currentWebUsername = ref("");
+const currentWebUserIsAdmin = ref(false);
 const newUsername = ref("");
 const newUserPassword = ref("");
 const addingUser = ref(false);
@@ -3082,11 +3084,18 @@ async function loadWebUsers() {
   if (!isWeb) return;
   webUsersLoading.value = true;
   try {
-    const [usersRes, checkRes] = await Promise.all([fetch(apiUrl("/api/auth/users")), fetch(apiUrl("/api/auth/check"))]);
-    if (usersRes.ok) webUsers.value = await usersRes.json();
+    // User management is admin-only; non-admins skip the users request entirely.
+    const checkRes = await fetch(apiUrl("/api/auth/check"));
     if (checkRes.ok) {
       const check = await checkRes.json();
       currentWebUsername.value = check.username || "";
+      currentWebUserIsAdmin.value = check.is_admin === true;
+    }
+    if (currentWebUserIsAdmin.value) {
+      const usersRes = await fetch(apiUrl("/api/auth/users"));
+      if (usersRes.ok) webUsers.value = await usersRes.json();
+    } else {
+      webUsers.value = [];
     }
   } catch {
     // keep the previous list
@@ -8654,7 +8663,7 @@ LIMIT 100;</pre
                 </p>
               </div>
 
-              <div class="space-y-3">
+              <div v-if="currentWebUserIsAdmin" class="space-y-3">
                 <Label class="text-base">{{ t("auth.users") }}</Label>
                 <p class="text-sm text-muted-foreground">
                   {{ t("auth.usersDescription") }}
@@ -8666,6 +8675,7 @@ LIMIT 100;</pre
                         <span class="truncate text-sm font-medium">{{ user.username }}</span>
                         <span v-if="user.username === currentWebUsername" class="shrink-0 text-xs text-muted-foreground">({{ t("auth.currentUserBadge") }})</span>
                         <span v-if="user.managedByEnv" class="shrink-0 text-xs text-muted-foreground">{{ t("auth.envManaged") }}</span>
+                        <span v-if="user.isAdmin" class="shrink-0 text-xs text-muted-foreground">{{ t("auth.adminBadge") }}</span>
                       </div>
                       <div v-if="!user.managedByEnv" class="flex shrink-0 items-center gap-1">
                         <Button type="button" variant="outline" size="sm" @click="((resettingUserId = resettingUserId === user.id ? null : (user.id ?? null)), (resetPasswordInput = ''))">

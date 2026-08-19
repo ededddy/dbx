@@ -148,6 +148,7 @@ export default withEnglishFallback({
     resetPassword: "Reimposta password",
     currentUserBadge: "tu",
     envManaged: "Gestito tramite variabili d'ambiente",
+    adminBadge: "Admin",
     userCreated: "Utente creato",
     userDeleted: "Utente eliminato",
     passwordReset: "Password reimpostata",

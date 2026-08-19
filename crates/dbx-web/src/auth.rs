@@ -52,9 +52,11 @@ pub struct AuthCheckResponse {
     pub setup_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// True when the signed-in account may manage user accounts.
+    pub is_admin: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +66,8 @@ pub struct UserSummary {
     pub created_at: Option<i64>,
     /// True for host-provided env accounts, which cannot be managed here.
     pub managed_by_env: bool,
+    /// Env accounts always count as admin (they are host-provisioned).
+    pub is_admin: bool,
 }
 
 const MAX_ATTEMPTS: u32 = 5;
@@ -109,10 +113,57 @@ async fn resolve_user_hash(state: &WebState, username: &str) -> Option<String> {
     state.app.storage.load_user_by_username(username).await.ok().flatten().map(|u| u.password_hash)
 }
 
-async fn drop_sessions_for_user(state: &WebState, username: &str) {
+/// Env-provisioned accounts are host-superusers; DB users are admins when
+/// their row carries the admin flag.
+async fn is_admin_username(state: &WebState, username: &str) -> bool {
+    if state.bootstrap_users.keys().any(|u| u.eq_ignore_ascii_case(username)) {
+        return true;
+    }
+    state.app.storage.load_user_by_username(username).await.ok().flatten().is_some_and(|u| u.is_admin)
+}
+
+/// Username owning the session token in these headers, if the session is valid.
+async fn session_username(state: &WebState, headers: &axum::http::HeaderMap) -> Option<String> {
+    let token = session_token_from_headers(headers)?;
+    state.sessions.read().await.get(&token).cloned()
+}
+
+/// Gate for user-management endpoints: a valid session whose account is an
+/// admin. Returns the session's username on success.
+async fn require_admin_session(state: &WebState, headers: &axum::http::HeaderMap) -> Result<String, StatusCode> {
+    let username = session_username(state, headers).await.ok_or(StatusCode::UNAUTHORIZED)?;
+    if !is_admin_username(state, &username).await {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(username)
+}
+
+/// Drops every session of `username` except `keep_token` (the session that
+/// just proved the old password, so the acting user is not logged out).
+async fn drop_sessions_for_user(state: &WebState, username: &str, keep_token: Option<&str>) {
     // Sessions store the username as typed at login, whose casing may differ
     // from the account name (usernames match case-insensitively).
-    state.sessions.write().await.retain(|_, u| !u.eq_ignore_ascii_case(username));
+    let dropped: Vec<String> = {
+        let sessions = state.sessions.read().await;
+        sessions
+            .iter()
+            .filter(|(token, user)| user.eq_ignore_ascii_case(username) && Some(token.as_str()) != keep_token)
+            .map(|(token, _)| token.clone())
+            .collect()
+    };
+    if dropped.is_empty() {
+        return;
+    }
+    {
+        let mut sessions = state.sessions.write().await;
+        for token in &dropped {
+            sessions.remove(token);
+        }
+    }
+    // Dropped sessions lose their per-session saved-password scope, same as logout.
+    for token in &dropped {
+        state.app.session_credentials.clear_owner(token);
+    }
 }
 
 pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginRequest>) -> Result<Response, StatusCode> {
@@ -184,8 +235,18 @@ pub async fn setup(State(state): State<Arc<WebState>>, Json(body): Json<SetupReq
 
     let hash = hash_password(&body.password)?;
 
-    // Save to database
-    state.app.storage.create_user(&username, &hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Atomically claim the first account: a concurrent setup that loses the
+    // race sees a non-empty users table and is forbidden. The first account
+    // becomes the admin.
+    let created = state
+        .app
+        .storage
+        .create_first_user_if_empty(&username, &hash)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if created.is_none() {
+        return Err(StatusCode::FORBIDDEN);
+    }
     *state.has_db_users.write().await = true;
 
     // Auto-login: create session
@@ -198,24 +259,47 @@ pub async fn setup(State(state): State<Arc<WebState>>, Json(body): Json<SetupReq
 
 pub async fn check(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Json<AuthCheckResponse> {
     if state.password_disabled {
-        return Json(AuthCheckResponse { authenticated: true, required: false, setup_required: false, username: None });
+        return Json(AuthCheckResponse {
+            authenticated: true,
+            required: false,
+            setup_required: false,
+            username: None,
+            is_admin: false,
+        });
     }
     if !has_any_account(&state).await {
-        return Json(AuthCheckResponse { authenticated: false, required: false, setup_required: true, username: None });
+        return Json(AuthCheckResponse {
+            authenticated: false,
+            required: false,
+            setup_required: true,
+            username: None,
+            is_admin: false,
+        });
     }
     let username = match extract_session_token(&req) {
         Some(token) => state.sessions.read().await.get(&token).cloned(),
         None => None,
     };
-    Json(AuthCheckResponse { authenticated: username.is_some(), required: true, setup_required: false, username })
+    let is_admin = match username.as_deref() {
+        Some(username) => is_admin_username(&state, username).await,
+        None => false,
+    };
+    Json(AuthCheckResponse {
+        authenticated: username.is_some(),
+        required: true,
+        setup_required: false,
+        username,
+        is_admin,
+    })
 }
 
 pub async fn change_password(
     State(state): State<Arc<WebState>>,
     req: Request<axum::body::Body>,
 ) -> Result<Response, StatusCode> {
-    let session_user = match extract_session_token(&req) {
-        Some(token) => state.sessions.read().await.get(&token).cloned(),
+    let session_token = extract_session_token(&req);
+    let session_user = match session_token.as_deref() {
+        Some(token) => state.sessions.read().await.get(token).cloned(),
         None => None,
     };
     let body: ChangePasswordRequest = match axum::body::to_bytes(req.into_body(), 1024 * 16).await {
@@ -259,10 +343,19 @@ pub async fn change_password(
     let new_hash = hash_password(&body.new_password)?;
     state.app.storage.update_user_password(user.id, &new_hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Revoke all other sessions of this account so a stolen or stale session
+    // dies with the old password. The acting session proved the old password
+    // and stays signed in.
+    drop_sessions_for_user(&state, &user.username, session_token.as_deref()).await;
+
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
 }
 
-pub async fn list_users(State(state): State<Arc<WebState>>) -> Result<Json<Vec<UserSummary>>, StatusCode> {
+pub async fn list_users(
+    State(state): State<Arc<WebState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<UserSummary>>, StatusCode> {
+    require_admin_session(&state, &headers).await?;
     let db_users = state.app.storage.list_users().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut users: Vec<UserSummary> = db_users
         .into_iter()
@@ -271,10 +364,17 @@ pub async fn list_users(State(state): State<Arc<WebState>>) -> Result<Json<Vec<U
             username: u.username,
             created_at: Some(u.created_at),
             managed_by_env: false,
+            is_admin: u.is_admin,
         })
         .collect();
     for username in state.bootstrap_users.keys() {
-        users.push(UserSummary { id: None, username: username.clone(), created_at: None, managed_by_env: true });
+        users.push(UserSummary {
+            id: None,
+            username: username.clone(),
+            created_at: None,
+            managed_by_env: true,
+            is_admin: true,
+        });
     }
     users.sort_by_key(|u| u.username.to_lowercase());
     Ok(Json(users))
@@ -282,8 +382,10 @@ pub async fn list_users(State(state): State<Arc<WebState>>) -> Result<Json<Vec<U
 
 pub async fn create_user(
     State(state): State<Arc<WebState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<Response, StatusCode> {
+    require_admin_session(&state, &headers).await?;
     let username = body.username.trim().to_string();
     if username.is_empty() || body.password.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -307,7 +409,7 @@ pub async fn create_user(
     }
 
     let hash = hash_password(&body.password)?;
-    state.app.storage.create_user(&username, &hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.app.storage.create_user(&username, &hash, false).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     *state.has_db_users.write().await = true;
 
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
@@ -318,41 +420,42 @@ pub async fn delete_user(
     Path(id): Path<i64>,
     req: Request<axum::body::Body>,
 ) -> Result<Response, StatusCode> {
-    let session_user = match extract_session_token(&req) {
-        Some(token) => state.sessions.read().await.get(&token).cloned(),
-        None => None,
-    };
+    let session_user = require_admin_session(&state, req.headers()).await?;
 
     let users = state.app.storage.list_users().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let Some(target) = users.iter().find(|u| u.id == id) else {
         return Err(StatusCode::NOT_FOUND);
     };
 
-    if session_user.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(&target.username)) {
+    if session_user.eq_ignore_ascii_case(&target.username) {
         return Ok((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "You cannot delete your own account"})))
-            .into_response());
-    }
-    if users.len() <= 1 {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Cannot delete the last user account"})),
-        )
             .into_response());
     }
 
     let username = target.username.clone();
-    state.app.storage.delete_user(id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    *state.has_db_users.write().await = users.len() > 1;
-    drop_sessions_for_user(&state, &username).await;
-
-    Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
+    // Atomic: the delete only happens while another account remains, so
+    // concurrent deletions cannot remove the last account.
+    match state.app.storage.delete_user_if_not_last(id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+        dbx_core::storage::DeleteUserResult::Deleted { remaining } => {
+            *state.has_db_users.write().await = remaining > 0;
+            drop_sessions_for_user(&state, &username, None).await;
+            Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
+        }
+        dbx_core::storage::DeleteUserResult::LastUser => {
+            Ok((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Cannot delete the last user account"})))
+                .into_response())
+        }
+        dbx_core::storage::DeleteUserResult::NotFound => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 pub async fn reset_user_password(
     State(state): State<Arc<WebState>>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
     Json(body): Json<ResetPasswordRequest>,
 ) -> Result<Response, StatusCode> {
+    require_admin_session(&state, &headers).await?;
     if body.password.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -364,7 +467,10 @@ pub async fn reset_user_password(
 
     let hash = hash_password(&body.password)?;
     state.app.storage.update_user_password(id, &hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    drop_sessions_for_user(&state, &target.username).await;
+    // Keep the acting admin's own session alive when the target is a different
+    // account; all of the target account's sessions are revoked.
+    let keep = session_token_from_headers(&headers);
+    drop_sessions_for_user(&state, &target.username, keep.as_deref()).await;
 
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
 }
@@ -468,12 +574,13 @@ pub async fn auth_middleware(
 mod tests {
     use super::{
         api_path_suffix, auth_middleware, change_password, check, create_user, delete_user, hash_password, list_users,
-        login, middleware_api_path_suffix, setup, CreateUserRequest, LoginRequest, SetupRequest,
+        login, middleware_api_path_suffix, reset_user_password, setup, CreateUserRequest, LoginRequest,
+        ResetPasswordRequest, SetupRequest,
     };
     use crate::state::WebState;
     use axum::body::Body;
     use axum::extract::{Path, State};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
     use axum::Json;
     use dbx_core::connection::AppState;
     use dbx_core::storage::Storage;
@@ -525,6 +632,16 @@ mod tests {
         cookie.strip_prefix("dbx_session=").unwrap().split(';').next().unwrap().to_string()
     }
 
+    fn auth_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", format!("dbx_session={token}").parse().unwrap());
+        headers
+    }
+
+    async fn add_user(state: &Arc<WebState>, username: &str, password: &str, is_admin: bool) -> i64 {
+        state.app.storage.create_user(username, &hash_password(password).unwrap(), is_admin).await.unwrap()
+    }
+
     #[tokio::test]
     async fn setup_creates_first_user_and_rejects_second_setup() {
         let (state, dir) = test_state().await;
@@ -545,6 +662,16 @@ mod tests {
         assert_eq!(state.app.storage.count_users().await.unwrap(), 1);
         assert!(*state.has_db_users.read().await);
 
+        // The first account is the admin, and its session reports as such.
+        let admin = state.app.storage.load_user_by_username("admin").await.unwrap().unwrap();
+        assert!(admin.is_admin);
+        let cookie = res.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+        let token = cookie.strip_prefix("dbx_session=").unwrap().split(';').next().unwrap();
+        let req = Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::empty()).unwrap();
+        let res = check(State(state.clone()), req).await;
+        assert!(res.authenticated);
+        assert!(res.is_admin);
+
         // Second setup attempt is forbidden.
         let err = setup(
             State(state.clone()),
@@ -557,11 +684,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn setup_is_atomic_under_concurrency() {
+        let (state, dir) = test_state().await;
+
+        // Concurrent first-run setups must create exactly one account.
+        let mut tasks = Vec::new();
+        for index in 0..8 {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move {
+                setup(
+                    State(state),
+                    Json(SetupRequest { username: format!("user-{index}"), password: "secret".to_string() }),
+                )
+                .await
+            }));
+        }
+        let mut ok = 0;
+        let mut forbidden = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(res) => {
+                    assert_eq!(res.status(), StatusCode::OK);
+                    ok += 1;
+                }
+                Err(status) => {
+                    assert_eq!(status, StatusCode::FORBIDDEN);
+                    forbidden += 1;
+                }
+            }
+        }
+        assert_eq!(ok, 1);
+        assert_eq!(forbidden, 7);
+        assert_eq!(state.app.storage.count_users().await.unwrap(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn login_with_username_and_password_only_default() {
         let (state, dir) = test_state().await;
-        state.app.storage.create_user("admin", &hash_password("secret").unwrap()).await.unwrap();
-        state.app.storage.create_user("alice", &hash_password("wonderland").unwrap()).await.unwrap();
+        add_user(&state, "admin", "secret", true).await;
+        add_user(&state, "alice", "wonderland", false).await;
         *state.has_db_users.write().await = true;
 
         // Wrong password is rejected.
@@ -580,11 +744,18 @@ mod tests {
         let token = login_token(&state, Some("alice"), "wonderland").await;
         assert_eq!(state.sessions.read().await.get(&token).map(String::as_str), Some("alice"));
 
-        // check reports the session's username.
+        // check reports the session's username and admin flag.
         let req = Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::empty()).unwrap();
         let res = check(State(state.clone()), req).await;
         assert!(res.authenticated);
         assert_eq!(res.username.as_deref(), Some("alice"));
+        assert!(!res.is_admin);
+
+        let admin_token = login_token(&state, None, "secret").await;
+        let req =
+            Request::builder().header("cookie", format!("dbx_session={admin_token}")).body(Body::empty()).unwrap();
+        let res = check(State(state.clone()), req).await;
+        assert!(res.is_admin);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -592,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn change_password_updates_db_user() {
         let (state, dir) = test_state().await;
-        state.app.storage.create_user("admin", &hash_password("old").unwrap()).await.unwrap();
+        add_user(&state, "admin", "old", true).await;
         *state.has_db_users.write().await = true;
         let token = login_token(&state, None, "old").await;
 
@@ -604,6 +775,27 @@ mod tests {
         // Old password no longer works, new one does.
         assert!(login(State(state.clone()), login_body(None, "old")).await.is_err());
         login_token(&state, None, "new").await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn change_password_revokes_other_sessions() {
+        let (state, dir) = test_state().await;
+        add_user(&state, "admin", "old", true).await;
+        *state.has_db_users.write().await = true;
+        let current = login_token(&state, None, "old").await;
+        let other = login_token(&state, None, "old").await;
+
+        let body = serde_json::to_string(&serde_json::json!({"old_password": "old", "new_password": "new"})).unwrap();
+        let req = Request::builder().header("cookie", format!("dbx_session={current}")).body(Body::from(body)).unwrap();
+        let res = change_password(State(state.clone()), req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The acting session stays signed in; every other session of the
+        // account is revoked.
+        assert!(state.sessions.read().await.contains_key(&current));
+        assert!(!state.sessions.read().await.contains_key(&other));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -657,8 +849,8 @@ mod tests {
     #[tokio::test]
     async fn delete_user_drops_sessions_regardless_of_login_casing() {
         let (state, dir) = test_state().await;
-        state.app.storage.create_user("admin", &hash_password("secret").unwrap()).await.unwrap();
-        state.app.storage.create_user("alice", &hash_password("wonderland").unwrap()).await.unwrap();
+        add_user(&state, "admin", "secret", true).await;
+        add_user(&state, "alice", "wonderland", false).await;
         *state.has_db_users.write().await = true;
         let admin_token = login_token(&state, None, "secret").await;
 
@@ -679,13 +871,14 @@ mod tests {
     #[tokio::test]
     async fn create_and_delete_user_guards() {
         let (state, dir) = test_state().await;
-        state.app.storage.create_user("admin", &hash_password("secret").unwrap()).await.unwrap();
+        add_user(&state, "admin", "secret", true).await;
         *state.has_db_users.write().await = true;
         let admin_token = login_token(&state, None, "secret").await;
 
         // Duplicate username is rejected (case-insensitive).
         let res = create_user(
             State(state.clone()),
+            auth_headers(&admin_token),
             Json(CreateUserRequest { username: "ADMIN".to_string(), password: "x".to_string() }),
         )
         .await
@@ -694,11 +887,15 @@ mod tests {
 
         let res = create_user(
             State(state.clone()),
+            auth_headers(&admin_token),
             Json(CreateUserRequest { username: "bob".to_string(), password: "pw".to_string() }),
         )
         .await
         .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+
+        // Admin-created accounts are non-admins.
+        assert!(!state.app.storage.load_user_by_username("bob").await.unwrap().unwrap().is_admin);
 
         let users = state.app.storage.list_users().await.unwrap();
         let admin_id = users.iter().find(|u| u.username == "admin").unwrap().id;
@@ -717,11 +914,6 @@ mod tests {
         let res = delete_user(State(state.clone()), Path(bob_id), req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(!state.sessions.read().await.contains_key(&bob_token));
-
-        // Deleting the last remaining user is refused.
-        let req = Request::builder().body(Body::empty()).unwrap();
-        let res = delete_user(State(state.clone()), Path(admin_id), req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(state.app.storage.count_users().await.unwrap(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -733,7 +925,7 @@ mod tests {
         use tower::ServiceExt;
 
         let (state, dir) = test_state().await;
-        state.app.storage.create_user("admin", &hash_password("secret").unwrap()).await.unwrap();
+        add_user(&state, "admin", "secret", true).await;
         *state.has_db_users.write().await = true;
 
         let app = axum::Router::new()
@@ -776,6 +968,144 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn user_management_requires_admin() {
+        let (state, dir) = test_state().await;
+        let admin_id = add_user(&state, "admin", "secret", true).await;
+        add_user(&state, "alice", "wonderland", false).await;
+        *state.has_db_users.write().await = true;
+        let alice_token = login_token(&state, Some("alice"), "wonderland").await;
+        let admin_token = login_token(&state, None, "secret").await;
+
+        // A signed-in non-admin is forbidden from every management endpoint.
+        let err = list_users(State(state.clone()), auth_headers(&alice_token)).await.unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+
+        let err = create_user(
+            State(state.clone()),
+            auth_headers(&alice_token),
+            Json(CreateUserRequest { username: "mallory".to_string(), password: "pw".to_string() }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+
+        let req =
+            Request::builder().header("cookie", format!("dbx_session={alice_token}")).body(Body::empty()).unwrap();
+        let err = delete_user(State(state.clone()), Path(admin_id), req).await.unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+
+        let err = reset_user_password(
+            State(state.clone()),
+            auth_headers(&alice_token),
+            Path(admin_id),
+            Json(ResetPasswordRequest { password: "hacked".to_string() }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+
+        // No session at all is unauthorized.
+        let err = list_users(State(state.clone()), HeaderMap::new()).await.unwrap_err();
+        assert_eq!(err, StatusCode::UNAUTHORIZED);
+
+        // The admin passes, and sees both accounts with their roles.
+        let users = list_users(State(state.clone()), auth_headers(&admin_token)).await.unwrap().0;
+        assert_eq!(users.len(), 2);
+        assert!(users.iter().find(|u| u.username == "admin").unwrap().is_admin);
+        assert!(!users.iter().find(|u| u.username == "alice").unwrap().is_admin);
+
+        // Nothing changed: alice's attempts had no effect.
+        assert_eq!(state.app.storage.count_users().await.unwrap(), 2);
+        login_token(&state, None, "secret").await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn reset_user_password_requires_admin_and_revokes_sessions() {
+        let (state, dir) = test_state().await;
+        let admin_id = add_user(&state, "admin", "secret", true).await;
+        let alice_id = add_user(&state, "alice", "wonderland", false).await;
+        *state.has_db_users.write().await = true;
+
+        // Cross-account reset by a signed-in non-admin is forbidden and the
+        // target's password stays unchanged.
+        let alice_token = login_token(&state, Some("alice"), "wonderland").await;
+        let err = reset_user_password(
+            State(state.clone()),
+            auth_headers(&alice_token),
+            Path(admin_id),
+            Json(ResetPasswordRequest { password: "hacked".to_string() }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+        assert!(login(State(state.clone()), login_body(None, "hacked")).await.is_err());
+        login_token(&state, None, "secret").await;
+
+        // An admin reset works, revokes the target's sessions, and keeps the
+        // acting admin's own session alive.
+        let admin_token = login_token(&state, None, "secret").await;
+        let res = reset_user_password(
+            State(state.clone()),
+            auth_headers(&admin_token),
+            Path(alice_id),
+            Json(ResetPasswordRequest { password: "reset-pw".to_string() }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!state.sessions.read().await.contains_key(&alice_token));
+        assert!(state.sessions.read().await.contains_key(&admin_token));
+        assert!(login(State(state.clone()), login_body(Some("alice"), "wonderland")).await.is_err());
+        login_token(&state, Some("alice"), "reset-pw").await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_user_is_atomic_under_concurrency() {
+        let (state, dir) = test_state().await;
+        // An env-provisioned admin can delete any DB account (never itself).
+        let state = {
+            let mut s = WebState::for_tests(state.app.clone(), dir.clone());
+            s.bootstrap_users.insert("hostadmin".to_string(), hash_password("envpw").unwrap());
+            Arc::new(s)
+        };
+        let first_id = add_user(&state, "first", "pw", false).await;
+        let second_id = add_user(&state, "second", "pw", false).await;
+        *state.has_db_users.write().await = true;
+        let token = login_token(&state, Some("hostadmin"), "envpw").await;
+
+        // Concurrently deleting the last two accounts must keep exactly one.
+        let mut tasks = Vec::new();
+        for id in [first_id, second_id] {
+            let state = state.clone();
+            let token = token.clone();
+            tasks.push(tokio::spawn(async move {
+                let req =
+                    Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::empty()).unwrap();
+                delete_user(State(state), Path(id), req).await.unwrap().status()
+            }));
+        }
+        let mut ok = 0;
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                StatusCode::BAD_REQUEST => rejected += 1,
+                status => panic!("unexpected status {status}"),
+            }
+        }
+        assert_eq!(ok, 1);
+        assert_eq!(rejected, 1);
+        assert_eq!(state.app.storage.count_users().await.unwrap(), 1);
+        assert!(*state.has_db_users.read().await);
 
         std::fs::remove_dir_all(&dir).ok();
     }

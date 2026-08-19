@@ -3479,7 +3479,8 @@ mod tests {
     #[tokio::test]
     async fn web_backend_rejects_self_signed_certificate_by_default() {
         let (base_url, _cert, _dir) = spawn_self_signed_https_server().await;
-        let backend = WebBackend::new_with_config(base_url, String::new(), None, None, None, None, false, None).unwrap();
+        let backend =
+            WebBackend::new_with_config(base_url, String::new(), None, None, None, None, false, None).unwrap();
         backend.auth.lock().await.checked = true;
 
         let error = backend.load_connections().await.unwrap_err();

@@ -149,6 +149,7 @@ export default withEnglishFallback({
     resetPassword: "パスワードをリセット",
     currentUserBadge: "現在のユーザー",
     envManaged: "環境変数で管理されています",
+    adminBadge: "管理者",
     userCreated: "ユーザーを作成しました",
     userDeleted: "ユーザーを削除しました",
     passwordReset: "パスワードをリセットしました",

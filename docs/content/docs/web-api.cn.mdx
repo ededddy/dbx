@@ -47,6 +47,7 @@ GET /api/auth/check
 | `setup_required` | 仍需首次创建账号 |
 | `authenticated` | 当前请求已持有有效会话 |
 | `username` | 已登录的账号名，仅在已认证时返回 |
+| `is_admin` | 已登录账号可以管理用户账号 |
 
 ### 首次设置账号
 
@@ -60,7 +61,7 @@ Content-Type: application/json
 }
 ```
 
-首次设置会创建第一个用户账号，仅在尚无任何账号时可用。
+首次设置会创建第一个用户账号，仅在尚无任何账号时可用。第一个账号会成为管理员；之后通过用户管理创建的账号为普通账号。
 
 ### 登录
 
@@ -89,7 +90,7 @@ Cookie: dbx_session=...
 
 ### 用户管理
 
-任何已登录会话都可以管理用户账号。通过 `DBX_PASSWORD`/`DBX_USERNAME` 环境变量配置的账号会以 `managedByEnv: true` 列出，无法通过 API 修改。
+只有管理员账号可以管理用户：首次设置创建的账号即为管理员，通过 `DBX_PASSWORD`/`DBX_USERNAME` 环境变量配置的账号始终视为管理员。环境变量账号会以 `managedByEnv: true` 列出，无法通过 API 修改。修改密码会使该账号的其他会话失效；重置其他账号的密码会使其全部会话失效。
 
 ```http
 GET /api/auth/users
@@ -98,7 +99,7 @@ Cookie: dbx_session=...
 
 ```json
 [
-  { "id": 1, "username": "admin", "createdAt": 1754800000000, "managedByEnv": false }
+  { "id": 1, "username": "admin", "createdAt": 1754800000000, "managedByEnv": false, "isAdmin": true }
 ]
 ```
 

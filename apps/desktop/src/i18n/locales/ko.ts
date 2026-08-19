@@ -148,6 +148,7 @@ export default withEnglishFallback({
     resetPassword: "비밀번호 재설정",
     currentUserBadge: "현재 사용자",
     envManaged: "환경 변수로 관리됨",
+    adminBadge: "관리자",
     userCreated: "사용자가 생성되었습니다",
     userDeleted: "사용자가 삭제되었습니다",
     passwordReset: "비밀번호가 재설정되었습니다",

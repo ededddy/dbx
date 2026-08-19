@@ -358,17 +358,28 @@ async fn main() {
 
     // One-time migration: seed an "admin" user from the legacy single-password
     // hash stored in app_settings so existing installs keep their password.
+    // One-time migration: seed an "admin" user from the legacy single-password
+    // hash stored in app_settings so existing installs keep their password.
     if bootstrap_users.is_empty() && !password_disabled {
         match app_state.storage.count_users().await {
             Ok(0) => {
                 if let Ok(Some(hash)) = app_state.storage.load_password_hash().await {
-                    match app_state.storage.create_user("admin", &hash).await {
-                        Ok(_) => log::info!("Migrated legacy web password to the 'admin' user account"),
+                    match app_state.storage.create_first_user_if_empty("admin", &hash).await {
+                        Ok(Some(_)) => log::info!("Migrated legacy web password to the 'admin' user account"),
+                        Ok(None) => {}
                         Err(e) => log::error!("Failed to migrate legacy web password: {e}"),
                     }
                 }
             }
-            Ok(_) => {}
+            Ok(_) => {
+                // Databases created before admin roles existed have no admin;
+                // promote the oldest account so user management stays reachable.
+                match app_state.storage.promote_oldest_user_if_no_admin().await {
+                    Ok(true) => log::info!("Promoted the oldest web user account to admin"),
+                    Ok(false) => {}
+                    Err(e) => log::error!("Failed to promote a web user to admin: {e}"),
+                }
+            }
             Err(e) => log::error!("Failed to count web users: {e}"),
         }
     }
