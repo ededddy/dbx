@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::state::WebState;
+use crate::state::{LoginRateLimit, SessionInfo, WebState};
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -30,6 +30,8 @@ pub struct SetupRequest {
 pub struct CreateUserRequest {
     pub username: String,
     pub password: String,
+    /// Admins may grant the new account admin rights too (default: no).
+    pub is_admin: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +78,34 @@ const DEFAULT_USERNAME: &str = "admin";
 
 fn session_cookie_path(state: &WebState) -> &str {
     state.public_base_path.as_str()
+}
+
+fn session_cookie(state: &WebState, token: &str) -> String {
+    let secure = if state.cookie_secure { "; Secure" } else { "" };
+    format!("dbx_session={token}; Path={}; HttpOnly; SameSite=Lax{secure}", session_cookie_path(state))
+}
+
+fn expired_session_cookie(state: &WebState) -> String {
+    let secure = if state.cookie_secure { "; Secure" } else { "" };
+    format!("dbx_session=; Path={}; HttpOnly; Max-Age=0{secure}", session_cookie_path(state))
+}
+
+/// Resolves a session token to its username, enforcing the optional idle
+/// timeout: expired sessions are dropped (with their credential scope), live
+/// sessions have their activity timestamp refreshed.
+async fn lookup_session(state: &WebState, token: &str) -> Option<String> {
+    let mut sessions = state.sessions.write().await;
+    let info = sessions.get_mut(token)?;
+    if let Some(timeout) = state.session_idle_timeout {
+        if info.last_active.elapsed() > timeout {
+            sessions.remove(token);
+            drop(sessions);
+            state.app.session_credentials.clear_owner(token);
+            return None;
+        }
+        info.last_active = std::time::Instant::now();
+    }
+    Some(info.username.clone())
 }
 
 fn hash_password(password: &str) -> Result<String, StatusCode> {
@@ -125,7 +155,7 @@ async fn is_admin_username(state: &WebState, username: &str) -> bool {
 /// Username owning the session token in these headers, if the session is valid.
 async fn session_username(state: &WebState, headers: &axum::http::HeaderMap) -> Option<String> {
     let token = session_token_from_headers(headers)?;
-    state.sessions.read().await.get(&token).cloned()
+    lookup_session(state, &token).await
 }
 
 /// Gate for user-management endpoints: a valid session whose account is an
@@ -147,7 +177,7 @@ async fn drop_sessions_for_user(state: &WebState, username: &str, keep_token: Op
         let sessions = state.sessions.read().await;
         sessions
             .iter()
-            .filter(|(token, user)| user.eq_ignore_ascii_case(username) && Some(token.as_str()) != keep_token)
+            .filter(|(token, info)| info.username.eq_ignore_ascii_case(username) && Some(token.as_str()) != keep_token)
             .map(|(token, _)| token.clone())
             .collect()
     };
@@ -172,10 +202,15 @@ pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
         return Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response());
     }
 
+    let username = normalize_username(body.username.as_deref());
+    // Rate limiting is per account (usernames match case-insensitively), so
+    // one account's failures never lock out the others.
+    let rate_limit_key = username.to_lowercase();
+
     // Check rate limit
     {
-        let rl = state.login_rate_limit.lock().await;
-        if let Some(locked_until) = rl.locked_until {
+        let limits = state.login_rate_limit.lock().await;
+        if let Some(locked_until) = limits.get(&rate_limit_key).and_then(|limit| limit.locked_until) {
             if locked_until > std::time::Instant::now() {
                 let remaining = (locked_until - std::time::Instant::now()).as_secs();
                 return Ok((
@@ -187,7 +222,6 @@ pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
         }
     }
 
-    let username = normalize_username(body.username.as_deref());
     let hash = resolve_user_hash(&state, &username).await;
     let verified = match hash.as_deref() {
         Some(hash) => verify_password(&body.password, hash),
@@ -195,26 +229,31 @@ pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
     };
 
     if !verified {
-        let mut rl = state.login_rate_limit.lock().await;
-        rl.fail_count += 1;
-        if rl.fail_count >= MAX_ATTEMPTS {
-            rl.locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(LOCKOUT_SECS));
-            rl.fail_count = 0;
+        let mut limits = state.login_rate_limit.lock().await;
+        // Keep the map bounded when attackers spray unknown usernames: drop
+        // entries that are neither locked nor mid-count before inserting.
+        if !limits.contains_key(&rate_limit_key) && limits.len() >= 4096 {
+            let now = std::time::Instant::now();
+            limits.retain(|_, limit| limit.locked_until.is_some_and(|locked_until| locked_until > now));
+        }
+        let limit = limits
+            .entry(rate_limit_key.clone())
+            .or_insert_with(|| LoginRateLimit { fail_count: 0, locked_until: None });
+        limit.fail_count += 1;
+        if limit.fail_count >= MAX_ATTEMPTS {
+            limit.locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(LOCKOUT_SECS));
+            limit.fail_count = 0;
         }
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Success — reset rate limit
-    {
-        let mut rl = state.login_rate_limit.lock().await;
-        rl.fail_count = 0;
-        rl.locked_until = None;
-    }
+    // Success — reset this account's rate limit
+    state.login_rate_limit.lock().await.remove(&rate_limit_key);
 
     let token = uuid::Uuid::new_v4().to_string();
-    state.sessions.write().await.insert(token.clone(), username);
+    state.sessions.write().await.insert(token.clone(), SessionInfo::new(username));
 
-    let cookie = format!("dbx_session={token}; Path={}; HttpOnly; SameSite=Lax", session_cookie_path(&state));
+    let cookie = session_cookie(&state, &token);
     Ok((StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response())
 }
 
@@ -251,9 +290,9 @@ pub async fn setup(State(state): State<Arc<WebState>>, Json(body): Json<SetupReq
 
     // Auto-login: create session
     let token = uuid::Uuid::new_v4().to_string();
-    state.sessions.write().await.insert(token.clone(), username);
+    state.sessions.write().await.insert(token.clone(), SessionInfo::new(username));
 
-    let cookie = format!("dbx_session={token}; Path={}; HttpOnly; SameSite=Lax", session_cookie_path(&state));
+    let cookie = session_cookie(&state, &token);
     Ok((StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response())
 }
 
@@ -277,7 +316,7 @@ pub async fn check(State(state): State<Arc<WebState>>, req: Request<axum::body::
         });
     }
     let username = match extract_session_token(&req) {
-        Some(token) => state.sessions.read().await.get(&token).cloned(),
+        Some(token) => lookup_session(&state, &token).await,
         None => None,
     };
     let is_admin = match username.as_deref() {
@@ -299,7 +338,7 @@ pub async fn change_password(
 ) -> Result<Response, StatusCode> {
     let session_token = extract_session_token(&req);
     let session_user = match session_token.as_deref() {
-        Some(token) => state.sessions.read().await.get(token).cloned(),
+        Some(token) => lookup_session(&state, token).await,
         None => None,
     };
     let body: ChangePasswordRequest = match axum::body::to_bytes(req.into_body(), 1024 * 16).await {
@@ -409,7 +448,15 @@ pub async fn create_user(
     }
 
     let hash = hash_password(&body.password)?;
-    state.app.storage.create_user(&username, &hash, false).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.app.storage.create_user(&username, &hash, body.is_admin == Some(true)).await.map_err(|e| {
+        // Lost a concurrent create race: the UNIQUE constraint is the
+        // final arbiter of the duplicate check above.
+        if e.contains("UNIQUE constraint failed") {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
     *state.has_db_users.write().await = true;
 
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
@@ -433,9 +480,18 @@ pub async fn delete_user(
     }
 
     let username = target.username.clone();
+    // Env-provisioned accounts are always admins and never stored in the users
+    // table, so the last-DB-admin guard only applies when no env account exists.
+    let allow_delete_last_admin = !state.bootstrap_users.is_empty();
     // Atomic: the delete only happens while another account remains, so
     // concurrent deletions cannot remove the last account.
-    match state.app.storage.delete_user_if_not_last(id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+    match state
+        .app
+        .storage
+        .delete_user_if_not_last(id, allow_delete_last_admin)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
         dbx_core::storage::DeleteUserResult::Deleted { remaining } => {
             *state.has_db_users.write().await = remaining > 0;
             drop_sessions_for_user(&state, &username, None).await;
@@ -443,6 +499,10 @@ pub async fn delete_user(
         }
         dbx_core::storage::DeleteUserResult::LastUser => {
             Ok((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Cannot delete the last user account"})))
+                .into_response())
+        }
+        dbx_core::storage::DeleteUserResult::LastAdmin => {
+            Ok((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Cannot delete the last admin account"})))
                 .into_response())
         }
         dbx_core::storage::DeleteUserResult::NotFound => Err(StatusCode::NOT_FOUND),
@@ -481,7 +541,7 @@ pub async fn logout(State(state): State<Arc<WebState>>, req: Request<axum::body:
         // 登出只清除当前登录会话的临时密码，不影响其他会话与桌面端凭据。
         state.app.session_credentials.clear_owner(&token);
     }
-    let cookie = format!("dbx_session=; Path={}; HttpOnly; Max-Age=0", session_cookie_path(&state));
+    let cookie = expired_session_cookie(&state);
     (StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response()
 }
 
@@ -555,7 +615,7 @@ pub async fn auth_middleware(
     // Check session token
     let token = extract_session_token(&req);
     if let Some(ref token) = token {
-        if state.sessions.read().await.contains_key(token) {
+        if lookup_session(&state, token).await.is_some() {
             // 在下游处理器及其 await 到的池创建路径上注入当前登录会话的 owner 作用域，
             // 使 save_password=false 连接的临时密码按会话隔离（见 SessionCredentialStore）。
             let owner = token.clone();
@@ -574,7 +634,7 @@ pub async fn auth_middleware(
 mod tests {
     use super::{
         api_path_suffix, auth_middleware, change_password, check, create_user, delete_user, hash_password, list_users,
-        login, middleware_api_path_suffix, reset_user_password, setup, CreateUserRequest, LoginRequest,
+        login, logout, middleware_api_path_suffix, reset_user_password, setup, CreateUserRequest, LoginRequest,
         ResetPasswordRequest, SetupRequest,
     };
     use crate::state::WebState;
@@ -738,11 +798,11 @@ mod tests {
 
         // Password-only login maps to the default "admin" account.
         let token = login_token(&state, None, "secret").await;
-        assert_eq!(state.sessions.read().await.get(&token).map(String::as_str), Some("admin"));
+        assert_eq!(state.sessions.read().await.get(&token).map(|info| info.username.as_str()), Some("admin"));
 
         // Named user login works.
         let token = login_token(&state, Some("alice"), "wonderland").await;
-        assert_eq!(state.sessions.read().await.get(&token).map(String::as_str), Some("alice"));
+        assert_eq!(state.sessions.read().await.get(&token).map(|info| info.username.as_str()), Some("alice"));
 
         // check reports the session's username and admin flag.
         let req = Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::empty()).unwrap();
@@ -813,7 +873,7 @@ mod tests {
         };
 
         let token = login_token(&state, Some("hostadmin"), "envpw").await;
-        assert_eq!(state.sessions.read().await.get(&token).map(String::as_str), Some("hostadmin"));
+        assert_eq!(state.sessions.read().await.get(&token).map(|info| info.username.as_str()), Some("hostadmin"));
 
         // Env accounts cannot change their password through the API.
         let body = serde_json::to_string(&serde_json::json!({"old_password": "envpw", "new_password": "new"})).unwrap();
@@ -835,7 +895,7 @@ mod tests {
 
         // Logging in with a different casing works, like DB-backed accounts.
         let token = login_token(&state, Some("hostadmin"), "envpw").await;
-        assert_eq!(state.sessions.read().await.get(&token).map(String::as_str), Some("hostadmin"));
+        assert_eq!(state.sessions.read().await.get(&token).map(|info| info.username.as_str()), Some("hostadmin"));
 
         // The account is still recognized as env-managed: password changes are rejected.
         let body = serde_json::to_string(&serde_json::json!({"old_password": "envpw", "new_password": "new"})).unwrap();
@@ -879,7 +939,7 @@ mod tests {
         let res = create_user(
             State(state.clone()),
             auth_headers(&admin_token),
-            Json(CreateUserRequest { username: "ADMIN".to_string(), password: "x".to_string() }),
+            Json(CreateUserRequest { username: "ADMIN".to_string(), password: "x".to_string(), is_admin: None }),
         )
         .await
         .unwrap();
@@ -888,7 +948,7 @@ mod tests {
         let res = create_user(
             State(state.clone()),
             auth_headers(&admin_token),
-            Json(CreateUserRequest { username: "bob".to_string(), password: "pw".to_string() }),
+            Json(CreateUserRequest { username: "bob".to_string(), password: "pw".to_string(), is_admin: None }),
         )
         .await
         .unwrap();
@@ -988,7 +1048,7 @@ mod tests {
         let err = create_user(
             State(state.clone()),
             auth_headers(&alice_token),
-            Json(CreateUserRequest { username: "mallory".to_string(), password: "pw".to_string() }),
+            Json(CreateUserRequest { username: "mallory".to_string(), password: "pw".to_string(), is_admin: None }),
         )
         .await
         .unwrap_err();
@@ -1106,6 +1166,122 @@ mod tests {
         assert_eq!(rejected, 1);
         assert_eq!(state.app.storage.count_users().await.unwrap(), 1);
         assert!(*state.has_db_users.read().await);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn login_rate_limit_is_per_username() {
+        let (state, dir) = test_state().await;
+        add_user(&state, "admin", "secret", true).await;
+        add_user(&state, "alice", "wonderland", false).await;
+        *state.has_db_users.write().await = true;
+
+        // Lock alice out with repeated failures.
+        for _ in 0..5 {
+            let err = login(State(state.clone()), login_body(Some("alice"), "wrong")).await.unwrap_err();
+            assert_eq!(err, StatusCode::UNAUTHORIZED);
+        }
+        // Alice is now rate-limited, even with the right password.
+        let res = login(State(state.clone()), login_body(Some("alice"), "wonderland")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Other accounts are unaffected by her lockout.
+        login_token(&state, None, "secret").await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_cookie_secure_flag_is_deployer_opt_in() {
+        let (state, dir) = test_state().await;
+        add_user(&state, "admin", "secret", true).await;
+        *state.has_db_users.write().await = true;
+
+        // Default: no Secure attribute (plain-HTTP self-hosting keeps working).
+        let res = login(State(state.clone()), login_body(None, "secret")).await.unwrap();
+        let cookie = res.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+        assert!(!cookie.contains("Secure"));
+
+        // Opt-in: Secure is set on both the session and the clearing cookie.
+        let state = {
+            let mut s = WebState::for_tests(state.app.clone(), dir.clone());
+            s.cookie_secure = true;
+            Arc::new(s)
+        };
+        *state.has_db_users.write().await = true;
+        let res = login(State(state.clone()), login_body(None, "secret")).await.unwrap();
+        let cookie = res.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+        assert!(cookie.contains("; Secure"));
+
+        let req = Request::builder().header("cookie", cookie).body(Body::empty()).unwrap();
+        let res = logout(State(state.clone()), req).await;
+        let cleared = res.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+        assert!(cleared.contains("; Secure"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn sessions_expire_after_configured_idle_timeout() {
+        let (state, dir) = test_state().await;
+        let state = {
+            let mut s = WebState::for_tests(state.app.clone(), dir.clone());
+            s.session_idle_timeout = Some(std::time::Duration::from_millis(50));
+            Arc::new(s)
+        };
+        add_user(&state, "admin", "secret", true).await;
+        *state.has_db_users.write().await = true;
+        let token = login_token(&state, None, "secret").await;
+
+        // An active session authenticates and refreshes its activity timestamp.
+        let before = state.sessions.read().await.get(&token).unwrap().last_active;
+        let req = Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::empty()).unwrap();
+        let res = check(State(state.clone()), req).await;
+        assert!(res.authenticated);
+        assert!(state.sessions.read().await.get(&token).unwrap().last_active >= before);
+
+        // Idle past the timeout: the session is dropped and no longer authenticates.
+        state.sessions.write().await.get_mut(&token).unwrap().last_active =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let req = Request::builder().header("cookie", format!("dbx_session={token}")).body(Body::empty()).unwrap();
+        let res = check(State(state.clone()), req).await;
+        assert!(!res.authenticated);
+        assert!(!state.sessions.read().await.contains_key(&token));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn admin_can_create_admin_and_admins_can_delete_each_other() {
+        let (state, dir) = test_state().await;
+        add_user(&state, "admin", "secret", true).await;
+        add_user(&state, "alice", "wonderland", false).await;
+        *state.has_db_users.write().await = true;
+        let admin_token = login_token(&state, None, "secret").await;
+
+        // Admins may grant admin rights to new accounts.
+        let res = create_user(
+            State(state.clone()),
+            auth_headers(&admin_token),
+            Json(CreateUserRequest { username: "bob".to_string(), password: "pw".to_string(), is_admin: Some(true) }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(state.app.storage.load_user_by_username("bob").await.unwrap().unwrap().is_admin);
+
+        // The new admin can use the management endpoints.
+        let bob_token = login_token(&state, Some("bob"), "pw").await;
+        let users = list_users(State(state.clone()), auth_headers(&bob_token)).await.unwrap().0;
+        assert_eq!(users.len(), 3);
+
+        // With two admins present, one may delete the other.
+        let users = state.app.storage.list_users().await.unwrap();
+        let admin_id = users.iter().find(|u| u.username == "admin").unwrap().id;
+        let req = Request::builder().header("cookie", format!("dbx_session={bob_token}")).body(Body::empty()).unwrap();
+        let res = delete_user(State(state.clone()), Path(admin_id), req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
         std::fs::remove_dir_all(&dir).ok();
     }

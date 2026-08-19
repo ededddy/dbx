@@ -593,6 +593,8 @@ pub enum DeleteUserResult {
     NotFound,
     /// Refused: the user is the last remaining account.
     LastUser,
+    /// Refused: the user is the last remaining admin account.
+    LastAdmin,
 }
 
 pub const DUCKDB_WORKER_MAX_PROCESSES_MIN: usize = 1;
@@ -2166,22 +2168,45 @@ impl Storage {
         .await
     }
 
-    /// Atomically deletes a user only when at least one other account remains,
-    /// so concurrent deletions cannot remove the last account.
-    pub async fn delete_user_if_not_last(&self, id: i64) -> Result<DeleteUserResult, String> {
+    /// Atomically deletes a user only when the account-count invariants hold:
+    /// at least one account must remain, and — unless `allow_delete_last_admin`
+    /// (an admin exists outside the users table, e.g. env-provisioned) — the
+    /// target may not be the last admin. Single statements, so concurrent
+    /// deletions cannot race past the guards.
+    pub async fn delete_user_if_not_last(
+        &self,
+        id: i64,
+        allow_delete_last_admin: bool,
+    ) -> Result<DeleteUserResult, String> {
         self.with_conn(move |conn| {
             let deleted = conn
-                .execute("DELETE FROM users WHERE id = ?1 AND (SELECT COUNT(*) FROM users) > 1", [id])
+                .execute(
+                    "DELETE FROM users WHERE id = ?1
+                     AND (SELECT COUNT(*) FROM users) > 1
+                     AND (?2 OR COALESCE((SELECT is_admin FROM users WHERE id = ?1), 0) = 0
+                          OR (SELECT COUNT(*) FROM users WHERE is_admin = 1) > 1)",
+                    params![id, allow_delete_last_admin],
+                )
                 .map_err(|e| e.to_string())?;
             if deleted > 0 {
                 let remaining: i64 =
                     conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0)).map_err(|e| e.to_string())?;
                 return Ok(DeleteUserResult::Deleted { remaining });
             }
+            // Diagnose which guard refused: the row is gone (a concurrent
+            // delete won), it is the last account, or the last admin.
             let exists: i64 = conn
                 .query_row("SELECT COUNT(*) FROM users WHERE id = ?1", [id], |row| row.get(0))
                 .map_err(|e| e.to_string())?;
-            Ok(if exists > 0 { DeleteUserResult::LastUser } else { DeleteUserResult::NotFound })
+            if exists == 0 {
+                return Ok(DeleteUserResult::NotFound);
+            }
+            let total: i64 =
+                conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+            if total <= 1 {
+                return Ok(DeleteUserResult::LastUser);
+            }
+            Ok(DeleteUserResult::LastAdmin)
         })
         .await
     }
@@ -8455,16 +8480,16 @@ mod tests {
         assert_eq!(admin.password_hash, "hash-3");
         assert!(admin.updated_at >= admin.created_at);
 
-        let result = storage.delete_user_if_not_last(alice_id).await.unwrap();
+        let result = storage.delete_user_if_not_last(alice_id, false).await.unwrap();
         assert_eq!(result, DeleteUserResult::Deleted { remaining: 1 });
         assert_eq!(storage.count_users().await.unwrap(), 1);
         assert!(storage.load_user_by_username("alice").await.unwrap().is_none());
 
         // The last remaining account cannot be deleted.
-        assert_eq!(storage.delete_user_if_not_last(admin_id).await.unwrap(), DeleteUserResult::LastUser);
+        assert_eq!(storage.delete_user_if_not_last(admin_id, false).await.unwrap(), DeleteUserResult::LastUser);
         assert_eq!(storage.count_users().await.unwrap(), 1);
         // An id that does not exist reports NotFound.
-        assert_eq!(storage.delete_user_if_not_last(9999).await.unwrap(), DeleteUserResult::NotFound);
+        assert_eq!(storage.delete_user_if_not_last(9999, false).await.unwrap(), DeleteUserResult::NotFound);
 
         std::fs::remove_file(&db).ok();
     }
@@ -8528,14 +8553,14 @@ mod tests {
         let db = temp_db_path("users-delete-race");
         let storage = Storage::open(&db).await.unwrap();
 
-        let first = storage.create_user("first", "hash-1", true).await.unwrap();
+        let first = storage.create_user("first", "hash-1", false).await.unwrap();
         let second = storage.create_user("second", "hash-2", false).await.unwrap();
 
         // Concurrently deleting the last two accounts must keep exactly one.
         let mut tasks = Vec::new();
         for id in [first, second] {
             let storage = storage.clone();
-            tasks.push(tokio::spawn(async move { storage.delete_user_if_not_last(id).await.unwrap() }));
+            tasks.push(tokio::spawn(async move { storage.delete_user_if_not_last(id, false).await.unwrap() }));
         }
         let mut deleted = 0;
         let mut last_user = 0;
@@ -8546,12 +8571,45 @@ mod tests {
                     assert_eq!(remaining, 1);
                 }
                 DeleteUserResult::LastUser => last_user += 1,
-                DeleteUserResult::NotFound => panic!("unexpected NotFound"),
+                other => panic!("unexpected {other:?}"),
             }
         }
         assert_eq!(deleted, 1);
         assert_eq!(last_user, 1);
         assert_eq!(storage.count_users().await.unwrap(), 1);
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_user_protects_last_admin_unless_external_admin_exists() {
+        let db = temp_db_path("users-delete-admin");
+        let storage = Storage::open(&db).await.unwrap();
+
+        let admin_id = storage.create_user("admin", "hash-1", true).await.unwrap();
+        let alice_id = storage.create_user("alice", "hash-2", false).await.unwrap();
+
+        // The only admin cannot be deleted while ordinary accounts remain.
+        assert_eq!(storage.delete_user_if_not_last(admin_id, false).await.unwrap(), DeleteUserResult::LastAdmin);
+        // ...unless an out-of-band admin exists (env-provisioned accounts).
+        assert_eq!(
+            storage.delete_user_if_not_last(admin_id, true).await.unwrap(),
+            DeleteUserResult::Deleted { remaining: 1 }
+        );
+        // With two admins present, deleting one of them passes the guard.
+        let bob_id = storage.create_user("bob", "hash-3", true).await.unwrap();
+        let carol_id = storage.create_user("carol", "hash-4", true).await.unwrap();
+        assert_eq!(
+            storage.delete_user_if_not_last(bob_id, false).await.unwrap(),
+            DeleteUserResult::Deleted { remaining: 2 }
+        );
+        // Ordinary accounts are unaffected by the admin guard.
+        assert_eq!(
+            storage.delete_user_if_not_last(alice_id, false).await.unwrap(),
+            DeleteUserResult::Deleted { remaining: 1 }
+        );
+        // The last account (here also the last admin) reports LastUser.
+        assert_eq!(storage.delete_user_if_not_last(carol_id, false).await.unwrap(), DeleteUserResult::LastUser);
 
         std::fs::remove_file(&db).ok();
     }

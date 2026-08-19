@@ -79,7 +79,22 @@ Content-Type: application/json
 
 On success, the response sets `Set-Cookie: dbx_session=...`. Reuse that cookie on later requests.
 
-Five consecutive login failures trigger an approximately 60-second lockout. Sessions live in the current Web process and require login again after restart. The cookie is `HttpOnly`, uses `SameSite=Lax`, and follows `DBX_PUBLIC_BASE_PATH` for its path.
+Five consecutive login failures on one account trigger an approximately 60-second lockout for that account only. Sessions live in the current Web process and require login again after restart; deployers can additionally mark the cookie `Secure` with `DBX_COOKIE_SECURE=1` and expire idle sessions with `DBX_SESSION_IDLE_TIMEOUT_MINUTES`. The cookie is `HttpOnly`, uses `SameSite=Lax`, and follows `DBX_PUBLIC_BASE_PATH` for its path.
+
+### Change Password
+
+```http
+POST /api/auth/change-password
+Content-Type: application/json
+Cookie: dbx_session=...
+
+{
+  "old_password": "current-password",
+  "new_password": "new-password"
+}
+```
+
+Any signed-in account can change its own password by proving the old one. On success, all other sessions of that account are revoked; the session that made the change stays signed in.
 
 ### Logout
 
@@ -90,7 +105,7 @@ Cookie: dbx_session=...
 
 ### User Management
 
-Only admin accounts can manage users — the first account created during setup is the admin, and accounts configured via the `DBX_PASSWORD`/`DBX_USERNAME` environment variables always count as admins. Env-provided accounts are listed with `managedByEnv: true` and cannot be modified through the API. Changing a password revokes the account's other sessions; resetting another account's password revokes all of its sessions.
+Only admin accounts can manage users — the first account created during setup is the admin, and accounts configured via the `DBX_PASSWORD`/`DBX_USERNAME` environment variables always count as admins. Admins may grant admin rights when creating an account (`is_admin: true`). Env-provided accounts are listed with `managedByEnv: true` and cannot be modified through the API. Changing a password revokes the account's other sessions; resetting another account's password revokes all of its sessions.
 
 ```http
 GET /api/auth/users
@@ -110,9 +125,12 @@ Cookie: dbx_session=...
 
 {
   "username": "alice",
-  "password": "her-password"
+  "password": "her-password",
+  "is_admin": false
 }
 ```
+
+`is_admin` is optional and defaults to `false`; admins may pass `true` to create another admin.
 
 ```http
 POST /api/auth/users/{id}/password
@@ -129,7 +147,7 @@ DELETE /api/auth/users/{id}
 Cookie: dbx_session=...
 ```
 
-Deleting your own account or the last remaining account is rejected.
+Deleting your own account, the last remaining account, or the last remaining admin account is rejected (the admin guard does not apply while an env-provisioned account exists).
 
 ### Environment Variables
 
@@ -138,6 +156,8 @@ Deleting your own account or the last remaining account is rejected.
 | `DBX_PASSWORD` | Pre-configure a login account at container startup (password) |
 | `DBX_USERNAME` | Username for the `DBX_PASSWORD` account; defaults to `admin` |
 | `DBX_DISABLE_PASSWORD=1` | Disable password protection entirely |
+| `DBX_COOKIE_SECURE` | `1`/`true` marks session cookies `Secure`; use with HTTPS deployments |
+| `DBX_SESSION_IDLE_TIMEOUT_MINUTES` | Expire sessions idle longer than this many minutes; unset or `0` keeps sessions until logout or restart |
 | `DBX_PORT` | Change the listen port (default `4224`) |
 | `DBX_DATA_DIR` | Data directory containing `dbx.db` |
 | `DBX_PUBLIC_BASE_PATH` | Serve DBX under a subpath such as `/dbx` |

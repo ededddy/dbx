@@ -1526,7 +1526,7 @@ pub async fn send_message(
 #[cfg(test)]
 mod tests {
     use super::{create_exchange, delete_user, list_tenants, send_message, ConnReq, CreateExchangeReq, SendMessageReq};
-    use crate::state::{LoginRateLimit, WebState};
+    use crate::state::WebState;
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue};
     use axum::Json;
@@ -1561,6 +1561,8 @@ mod tests {
             data_dir: dir.clone(),
             public_base_path: "/".to_string(),
             password_disabled: false,
+            cookie_secure: false,
+            session_idle_timeout: None,
             bootstrap_users: HashMap::new(),
             has_db_users: RwLock::new(false),
             sessions: RwLock::new(HashMap::new()),
@@ -1569,7 +1571,7 @@ mod tests {
             table_import_channels: RwLock::new(HashMap::new()),
             sql_file_executions: RwLock::new(HashMap::new()),
             nacos_imports: RwLock::new(HashMap::new()),
-            login_rate_limit: Mutex::new(LoginRateLimit { fail_count: 0, locked_until: None }),
+            login_rate_limit: Mutex::new(HashMap::new()),
             export_files: RwLock::new(HashMap::new()),
             ssh_prompts: Arc::new(crate::ssh_prompt::SshPromptHub::new()),
         });

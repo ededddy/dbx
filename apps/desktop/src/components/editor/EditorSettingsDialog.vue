@@ -3063,6 +3063,7 @@ const currentWebUsername = ref("");
 const currentWebUserIsAdmin = ref(false);
 const newUsername = ref("");
 const newUserPassword = ref("");
+const newUserIsAdmin = ref(false);
 const addingUser = ref(false);
 const resettingUserId = ref<number | null>(null);
 const resetPasswordInput = ref("");
@@ -3111,13 +3112,14 @@ async function addWebUser() {
     const res = await fetch(apiUrl("/api/auth/users"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: newUsername.value.trim(), password: newUserPassword.value }),
+      body: JSON.stringify({ username: newUsername.value.trim(), password: newUserPassword.value, is_admin: newUserIsAdmin.value }),
     });
     if (res.ok) {
       webUsersMessage.value = t("auth.userCreated");
       webUsersError.value = false;
       newUsername.value = "";
       newUserPassword.value = "";
+      newUserIsAdmin.value = false;
       await loadWebUsers();
     } else {
       webUsersMessage.value = await readAuthApiError(res);
@@ -3129,6 +3131,10 @@ async function addWebUser() {
   } finally {
     addingUser.value = false;
   }
+}
+
+function isCurrentWebUser(user: WebUserAccount): boolean {
+  return user.username.toLowerCase() === currentWebUsername.value.toLowerCase();
 }
 
 async function resetWebUserPassword(user: WebUserAccount) {
@@ -3216,6 +3222,7 @@ watch(
       webUsersMessage.value = "";
       newUsername.value = "";
       newUserPassword.value = "";
+      newUserIsAdmin.value = false;
       resettingUserId.value = null;
       resetPasswordInput.value = "";
       void loadWebUsers();
@@ -8673,15 +8680,15 @@ LIMIT 100;</pre
                     <div class="flex items-center justify-between gap-2">
                       <div class="flex min-w-0 items-center gap-2">
                         <span class="truncate text-sm font-medium">{{ user.username }}</span>
-                        <span v-if="user.username === currentWebUsername" class="shrink-0 text-xs text-muted-foreground">({{ t("auth.currentUserBadge") }})</span>
+                        <span v-if="isCurrentWebUser(user)" class="shrink-0 text-xs text-muted-foreground">({{ t("auth.currentUserBadge") }})</span>
                         <span v-if="user.managedByEnv" class="shrink-0 text-xs text-muted-foreground">{{ t("auth.envManaged") }}</span>
                         <span v-if="user.isAdmin" class="shrink-0 text-xs text-muted-foreground">{{ t("auth.adminBadge") }}</span>
                       </div>
-                      <div v-if="!user.managedByEnv" class="flex shrink-0 items-center gap-1">
+                      <div v-if="!user.managedByEnv && !isCurrentWebUser(user)" class="flex shrink-0 items-center gap-1">
                         <Button type="button" variant="outline" size="sm" @click="((resettingUserId = resettingUserId === user.id ? null : (user.id ?? null)), (resetPasswordInput = ''))">
                           {{ t("auth.resetPassword") }}
                         </Button>
-                        <Button v-if="user.username !== currentWebUsername" type="button" variant="outline" size="sm" class="text-destructive" @click="((userDeleteTarget = user), (userDeleteConfirmOpen = true))">
+                        <Button type="button" variant="outline" size="sm" class="text-destructive" @click="((userDeleteTarget = user), (userDeleteConfirmOpen = true))">
                           {{ t("common.delete") }}
                         </Button>
                       </div>
@@ -8697,6 +8704,10 @@ LIMIT 100;</pre
                 <div class="flex items-center gap-2">
                   <Input v-model="newUsername" :placeholder="t('auth.enterUsername')" class="h-9" autocomplete="off" />
                   <PasswordInput v-model="newUserPassword" :placeholder="t('auth.newPassword')" inputClass="h-9" autocomplete="off" />
+                  <label class="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+                    <input v-model="newUserIsAdmin" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
+                    {{ t("auth.adminBadge") }}
+                  </label>
                   <Button type="button" size="sm" class="shrink-0" :disabled="addingUser || !newUsername.trim() || !newUserPassword" @click="addWebUser">
                     {{ t("auth.addUser") }}
                   </Button>

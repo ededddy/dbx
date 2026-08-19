@@ -385,6 +385,18 @@ async fn main() {
     }
     let has_db_users = app_state.storage.count_users().await.unwrap_or(0) > 0;
 
+    // `DBX_COOKIE_SECURE=1` marks session cookies Secure (HTTPS deployments).
+    let cookie_secure = std::env::var("DBX_COOKIE_SECURE")
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    // `DBX_SESSION_IDLE_TIMEOUT_MINUTES=30` expires sessions idle longer than
+    // that; unset/0 means sessions live until logout or process restart.
+    let session_idle_timeout = std::env::var("DBX_SESSION_IDLE_TIMEOUT_MINUTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|minutes| *minutes > 0)
+        .map(|minutes| std::time::Duration::from_secs(minutes.saturating_mul(60)));
+
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
     let web_state = Arc::new(WebState {
@@ -392,6 +404,8 @@ async fn main() {
         data_dir,
         public_base_path: public_base_path.clone(),
         password_disabled,
+        cookie_secure,
+        session_idle_timeout,
         bootstrap_users,
         has_db_users: RwLock::new(has_db_users),
         sessions: RwLock::new(HashMap::new()),
@@ -400,7 +414,7 @@ async fn main() {
         table_import_channels: RwLock::new(HashMap::new()),
         sql_file_executions: RwLock::new(HashMap::new()),
         nacos_imports: RwLock::new(HashMap::new()),
-        login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
+        login_rate_limit: tokio::sync::Mutex::new(HashMap::new()),
         export_files: RwLock::new(HashMap::new()),
         ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
     });
