@@ -420,6 +420,9 @@ async fn main() {
     });
 
     ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
+    // Drops idle-expired sessions in the background so the session map stays
+    // bounded (no-op unless DBX_SESSION_IDLE_TIMEOUT_MINUTES is set).
+    auth::spawn_session_sweeper(web_state.clone());
 
     // API routes
     let api = Router::new()
@@ -1180,7 +1183,7 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind address");
     let shutdown_state = web_state.app.clone();
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async {
             if let Err(error) = tokio::signal::ctrl_c().await {
                 tracing::warn!("Failed to listen for shutdown signal: {error}");

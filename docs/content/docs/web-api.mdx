@@ -79,7 +79,7 @@ Content-Type: application/json
 
 On success, the response sets `Set-Cookie: dbx_session=...`. Reuse that cookie on later requests.
 
-Five consecutive login failures on one account trigger an approximately 60-second lockout for that account only. Sessions live in the current Web process and require login again after restart; deployers can additionally mark the cookie `Secure` with `DBX_COOKIE_SECURE=1` and expire idle sessions with `DBX_SESSION_IDLE_TIMEOUT_MINUTES`. The cookie is `HttpOnly`, uses `SameSite=Lax`, and follows `DBX_PUBLIC_BASE_PATH` for its path.
+Five consecutive login failures on one account from one source IP trigger an approximately 60-second lockout for that account and address only — other accounts and other addresses stay unaffected. Failed logins to unknown usernames count toward the lockout and every attempt runs the same password-hash verification, so neither the response nor its timing reveals whether an account exists. Sessions live in the current Web process and require login again after restart; deployers can additionally mark the cookie `Secure` with `DBX_COOKIE_SECURE=1` and expire idle sessions with `DBX_SESSION_IDLE_TIMEOUT_MINUTES`. The cookie is `HttpOnly`, uses `SameSite=Lax`, and follows `DBX_PUBLIC_BASE_PATH` for its path.
 
 ### Change Password
 
@@ -94,7 +94,7 @@ Cookie: dbx_session=...
 }
 ```
 
-Any signed-in account can change its own password by proving the old one. On success, all other sessions of that account are revoked; the session that made the change stays signed in.
+Any signed-in account can change its own password by proving the old one; the request can only target the session's own account (admins reset other accounts through user management instead). New passwords must be at least 8 characters, and failed old-password attempts share the login lockout. On success, all other sessions of that account are revoked; the session that made the change stays signed in.
 
 ### Logout
 
@@ -105,7 +105,7 @@ Cookie: dbx_session=...
 
 ### User Management
 
-Only admin accounts can manage users — the first account created during setup is the admin, and accounts configured via the `DBX_PASSWORD`/`DBX_USERNAME` environment variables always count as admins. Admins may grant admin rights when creating an account (`is_admin: true`). Env-provided accounts are listed with `managedByEnv: true` and cannot be modified through the API. Changing a password revokes the account's other sessions; resetting another account's password revokes all of its sessions.
+Only admin accounts can manage users — the first account created during setup is the admin, and accounts configured via the `DBX_PASSWORD`/`DBX_USERNAME` environment variables always count as admins. Admins may grant admin rights when creating an account (`is_admin: true`). Env-provided accounts are listed with `managedByEnv: true` and cannot be modified through the API; a database account shadowed by a same-named env account is not listed, since the env account is authoritative for that username. Passwords set here must be at least 8 characters. Changing a password revokes the account's other sessions; resetting another account's password revokes all of its sessions.
 
 ```http
 GET /api/auth/users
@@ -157,7 +157,7 @@ Deleting your own account, the last remaining account, or the last remaining adm
 | `DBX_USERNAME` | Username for the `DBX_PASSWORD` account; defaults to `admin` |
 | `DBX_DISABLE_PASSWORD=1` | Disable password protection entirely |
 | `DBX_COOKIE_SECURE` | `1`/`true` marks session cookies `Secure`; use with HTTPS deployments |
-| `DBX_SESSION_IDLE_TIMEOUT_MINUTES` | Expire sessions idle longer than this many minutes; unset or `0` keeps sessions until logout or restart |
+| `DBX_SESSION_IDLE_TIMEOUT_MINUTES` | Expire sessions idle longer than this many minutes; unset or `0` keeps sessions until logout or restart. Open SSE streams count as activity, and expired sessions are swept in the background once a minute |
 | `DBX_PORT` | Change the listen port (default `4224`) |
 | `DBX_DATA_DIR` | Data directory containing `dbx.db` |
 | `DBX_PUBLIC_BASE_PATH` | Serve DBX under a subpath such as `/dbx` |
