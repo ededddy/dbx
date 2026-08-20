@@ -95,7 +95,7 @@ fn session_cookie(state: &WebState, token: &str) -> String {
 
 fn expired_session_cookie(state: &WebState) -> String {
     let secure = if state.cookie_secure { "; Secure" } else { "" };
-    format!("dbx_session=; Path={}; HttpOnly; Max-Age=0{secure}", session_cookie_path(state))
+    format!("dbx_session=; Path={}; HttpOnly; SameSite=Lax; Max-Age=0{secure}", session_cookie_path(state))
 }
 
 /// Resolves a session token to its username, enforcing the optional idle
@@ -172,10 +172,12 @@ where
 /// IP: an attacker only ever locks out their own address, not the account for
 /// everyone else. Behind a reverse proxy all clients share the proxy's
 /// address, which degrades this to per-account (the previous behavior).
+/// Folding is ASCII-only, matching how usernames compare (`COLLATE NOCASE` /
+/// `eq_ignore_ascii_case`), so distinct non-ASCII usernames never share a bucket.
 fn rate_limit_key(username: &str, client_ip: Option<std::net::IpAddr>) -> String {
     match client_ip {
-        Some(ip) => format!("{}|{ip}", username.to_lowercase()),
-        None => format!("{}|unknown", username.to_lowercase()),
+        Some(ip) => format!("{}|{ip}", username.to_ascii_lowercase()),
+        None => format!("{}|unknown", username.to_ascii_lowercase()),
     }
 }
 
@@ -202,6 +204,12 @@ async fn record_auth_failure(state: &WebState, key: &str) {
     if !limits.contains_key(key) && limits.len() >= 4096 {
         let now = std::time::Instant::now();
         limits.retain(|_, limit| limit.locked_until.is_some_and(|locked_until| locked_until > now));
+        if limits.len() >= 4096 {
+            // Still full of actively-locked keys: skip tracking this failure
+            // rather than growing the map without bound. The login itself is
+            // still verified (and rejected) as usual.
+            return;
+        }
     }
     let limit = limits.entry(key.to_string()).or_insert_with(|| LoginRateLimit { fail_count: 0, locked_until: None });
     limit.fail_count += 1;
@@ -851,8 +859,9 @@ pub async fn auth_middleware(
 mod tests {
     use super::{
         api_path_suffix, auth_middleware, change_password, check, create_user, delete_user, hash_password, list_users,
-        login, logout, middleware_api_path_suffix, reset_user_password, setup, sweep_expired_sessions, touch_session,
-        ClientIp, CreateUserRequest, LoginRequest, ResetPasswordRequest, SetupRequest,
+        login, logout, middleware_api_path_suffix, rate_limit_key, record_auth_failure, reset_user_password, setup,
+        sweep_expired_sessions, touch_session, ClientIp, CreateUserRequest, LoginRequest, ResetPasswordRequest,
+        SetupRequest,
     };
     use crate::state::WebState;
     use axum::body::Body;
@@ -1436,6 +1445,7 @@ mod tests {
         let res = login(State(state.clone()), ClientIp(None), login_body(None, "secret")).await.unwrap();
         let cookie = res.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
         assert!(!cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Lax"));
 
         // Opt-in: Secure is set on both the session and the clearing cookie.
         let state = {
@@ -1452,6 +1462,7 @@ mod tests {
         let res = logout(State(state.clone()), req).await;
         let cleared = res.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
         assert!(cleared.contains("; Secure"));
+        assert!(cleared.contains("SameSite=Lax"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1828,6 +1839,45 @@ mod tests {
         let last_active = state.sessions.read().await.get(&token).unwrap().last_active;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert_eq!(state.sessions.read().await.get(&token).unwrap().last_active, last_active);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rate_limit_key_folds_ascii_only_like_account_matching() {
+        // ASCII case variants of one account share a bucket ...
+        assert_eq!(rate_limit_key("ADMIN", None), rate_limit_key("admin", None));
+        // ... while distinct non-ASCII usernames never do (account matching is
+        // ASCII-only too: UNIQUE ... COLLATE NOCASE / eq_ignore_ascii_case).
+        assert_ne!(rate_limit_key("ÄDMIN", None), rate_limit_key("ädmin", None));
+        // The source address separates buckets.
+        let ip: std::net::IpAddr = "203.0.113.1".parse().unwrap();
+        assert_ne!(rate_limit_key("admin", Some(ip)), rate_limit_key("admin", None));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_map_stays_bounded_under_lockout_spray() {
+        let (state, dir) = test_state().await;
+
+        // Fill the map with actively-locked entries.
+        {
+            let mut limits = state.login_rate_limit.lock().await;
+            for index in 0..4096 {
+                limits.insert(
+                    format!("user-{index}|unknown"),
+                    crate::state::LoginRateLimit {
+                        fail_count: 0,
+                        locked_until: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+                    },
+                );
+            }
+        }
+
+        // A failure for a brand-new key is not tracked beyond the cap.
+        record_auth_failure(&state, "sprayed|unknown").await;
+        let limits = state.login_rate_limit.lock().await;
+        assert_eq!(limits.len(), 4096);
+        assert!(!limits.contains_key("sprayed|unknown"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -391,11 +391,19 @@ async fn main() {
         .unwrap_or(false);
     // `DBX_SESSION_IDLE_TIMEOUT_MINUTES=30` expires sessions idle longer than
     // that; unset/0 means sessions live until logout or process restart.
-    let session_idle_timeout = std::env::var("DBX_SESSION_IDLE_TIMEOUT_MINUTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|minutes| *minutes > 0)
-        .map(|minutes| std::time::Duration::from_secs(minutes.saturating_mul(60)));
+    let session_idle_timeout = match std::env::var("DBX_SESSION_IDLE_TIMEOUT_MINUTES") {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(minutes) => Some(std::time::Duration::from_secs(minutes.saturating_mul(60))),
+            Err(_) => {
+                tracing::warn!(
+                    "Ignoring invalid DBX_SESSION_IDLE_TIMEOUT_MINUTES value {value:?}; idle session expiry is disabled"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
 
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
