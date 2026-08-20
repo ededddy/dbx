@@ -157,7 +157,7 @@ Deleting your own account, the last remaining account, or the last remaining adm
 | `DBX_USERNAME` | Username for the `DBX_PASSWORD` account; defaults to `admin` |
 | `DBX_DISABLE_PASSWORD=1` | Disable password protection entirely |
 | `DBX_COOKIE_SECURE` | `1`/`true` marks session cookies `Secure`; use with HTTPS deployments |
-| `DBX_SESSION_IDLE_TIMEOUT_MINUTES` | Expire sessions idle longer than this many minutes; unset or `0` keeps sessions until logout or restart. Open SSE streams count as activity, and expired sessions are swept in the background once a minute |
+| `DBX_SESSION_IDLE_TIMEOUT_MINUTES` | Expire sessions idle longer than this many minutes; unset or `0` keeps sessions until logout or restart. Open SSE streams and WebSocket connections count as activity, and expired sessions are swept in the background once a minute |
 | `DBX_PORT` | Change the listen port (default `4224`) |
 | `DBX_DATA_DIR` | Data directory containing `dbx.db` |
 | `DBX_PUBLIC_BASE_PATH` | Serve DBX under a subpath such as `/dbx` |

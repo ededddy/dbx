@@ -157,7 +157,7 @@ Cookie: dbx_session=...
 | `DBX_USERNAME` | `DBX_PASSWORD` 账号的用户名，默认为 `admin` |
 | `DBX_DISABLE_PASSWORD=1` | 完全关闭密码保护 |
 | `DBX_COOKIE_SECURE` | `1`/`true` 时会话 Cookie 带有 `Secure` 属性，用于 HTTPS 部署 |
-| `DBX_SESSION_IDLE_TIMEOUT_MINUTES` | 空闲超过该分钟数后会话过期；不设置或为 `0` 时会话保持到退出登录或进程重启。打开的 SSE 流会计为活跃，过期会话由后台任务每分钟清理一次 |
+| `DBX_SESSION_IDLE_TIMEOUT_MINUTES` | 空闲超过该分钟数后会话过期；不设置或为 `0` 时会话保持到退出登录或进程重启。打开的 SSE 流和 WebSocket 连接会计为活跃，过期会话由后台任务每分钟清理一次 |
 | `DBX_PORT` | 修改监听端口，默认 `4224` |
 | `DBX_DATA_DIR` | 存放 `dbx.db` 的数据目录 |
 | `DBX_PUBLIC_BASE_PATH` | 在子路径下提供服务，例如 `/dbx` |

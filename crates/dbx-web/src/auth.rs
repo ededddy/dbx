@@ -691,15 +691,15 @@ async fn touch_session(state: &WebState, token: &str) -> bool {
     }
 }
 
-/// Keeps a session active while a long-lived response (an SSE stream) is open:
-/// refreshes its activity timestamp periodically and aborts the refresh task
-/// when dropped, i.e. when the connection closes and the body is dropped.
-struct SessionKeepAlive {
+/// Keeps a session active while a long-lived connection (SSE stream,
+/// WebSocket) is open: refreshes its activity timestamp periodically and
+/// aborts the refresh task when dropped, i.e. when the connection closes.
+pub(crate) struct SessionKeepAlive {
     task: tokio::task::JoinHandle<()>,
 }
 
 impl SessionKeepAlive {
-    fn spawn(state: &Arc<WebState>, token: String) -> Option<Self> {
+    pub(crate) fn spawn(state: &Arc<WebState>, token: String) -> Option<Self> {
         let timeout = state.session_idle_timeout?;
         // Refresh comfortably inside the idle window.
         let tick = (timeout / 2).clamp(std::time::Duration::from_millis(10), SESSION_SWEEP_INTERVAL);
@@ -746,6 +746,18 @@ fn keep_session_alive_for_stream(state: &Arc<WebState>, token: String, response:
         chunk
     });
     Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
+/// Builds a session keep-alive for long-lived connections the middleware
+/// cannot wrap (WebSocket upgrades). The handler holds the returned guard for
+/// the connection's lifetime. `None` when no session cookie is present or no
+/// idle timeout is configured.
+pub(crate) fn session_keep_alive_from_headers(
+    state: &Arc<WebState>,
+    headers: &axum::http::HeaderMap,
+) -> Option<SessionKeepAlive> {
+    let token = session_token_from_headers(headers)?;
+    SessionKeepAlive::spawn(state, token)
 }
 
 /// Removes idle-expired sessions (and their credential scope), keeping the
@@ -859,9 +871,9 @@ pub async fn auth_middleware(
 mod tests {
     use super::{
         api_path_suffix, auth_middleware, change_password, check, create_user, delete_user, hash_password, list_users,
-        login, logout, middleware_api_path_suffix, rate_limit_key, record_auth_failure, reset_user_password, setup,
-        sweep_expired_sessions, touch_session, ClientIp, CreateUserRequest, LoginRequest, ResetPasswordRequest,
-        SetupRequest,
+        login, logout, middleware_api_path_suffix, rate_limit_key, record_auth_failure, reset_user_password,
+        session_keep_alive_from_headers, setup, sweep_expired_sessions, touch_session, ClientIp, CreateUserRequest,
+        LoginRequest, ResetPasswordRequest, SetupRequest,
     };
     use crate::state::WebState;
     use axum::body::Body;
@@ -1853,6 +1865,38 @@ mod tests {
         // The source address separates buckets.
         let ip: std::net::IpAddr = "203.0.113.1".parse().unwrap();
         assert_ne!(rate_limit_key("admin", Some(ip)), rate_limit_key("admin", None));
+    }
+
+    #[tokio::test]
+    async fn session_keep_alive_from_headers_refreshes_while_held() {
+        let (state, dir) = test_state().await;
+        let state = {
+            let mut s = WebState::for_tests(state.app.clone(), dir.clone());
+            s.session_idle_timeout = Some(std::time::Duration::from_millis(100));
+            Arc::new(s)
+        };
+        add_user(&state, "admin", "admin-password", true).await;
+        *state.has_db_users.write().await = true;
+        let token = login_token(&state, None, "admin-password").await;
+
+        // No session cookie, no guard.
+        assert!(session_keep_alive_from_headers(&state, &HeaderMap::new()).is_none());
+
+        let guard = session_keep_alive_from_headers(&state, &auth_headers(&token)).expect("keep-alive guard");
+        state.sessions.write().await.get_mut(&token).unwrap().last_active =
+            std::time::Instant::now() - std::time::Duration::from_secs(120);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let last_active = state.sessions.read().await.get(&token).unwrap().last_active;
+        assert!(last_active.elapsed() < std::time::Duration::from_secs(1));
+
+        // Dropping the guard (connection closed) stops refreshing.
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let last_active = state.sessions.read().await.get(&token).unwrap().last_active;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(state.sessions.read().await.get(&token).unwrap().last_active, last_active);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
