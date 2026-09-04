@@ -103,7 +103,7 @@ This guide gets you through three things:
     | `DBX_PORT` | `4224` | Container listen port |
     | `DBX_PUBLIC_BASE_PATH` | `/` | Deploy below a subpath, such as `/dbx` |
 
-    Without `DBX_PASSWORD`, the first visit shows a setup page that creates the initial username and password — that first account is the admin. Admin accounts can create and manage additional accounts under **Settings → Security**.
+    Without `DBX_PASSWORD`, the first visit shows a setup page that creates the initial username and password — that first account is the admin. Admin accounts can create and manage additional accounts under **Settings → Security**. Accounts gate login only: database connections and app settings are stored server-side and stay shared across all signed-in accounts.
 
     Then open `http://localhost:4224`.
 

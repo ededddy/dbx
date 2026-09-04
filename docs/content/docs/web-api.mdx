@@ -23,7 +23,7 @@ All API routes are under `/api`.
 
 ## Authentication
 
-Protected routes require a session cookie named `dbx_session`.
+Protected routes require a session cookie named `dbx_session`. Accounts gate login only: connections and settings are stored server-side and stay shared across all signed-in accounts.
 
 ### Check Auth State
 
