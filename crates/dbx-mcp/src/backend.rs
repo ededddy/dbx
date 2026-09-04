@@ -2477,7 +2477,7 @@ mod tests {
             }
         });
 
-        let backend = WebBackend::new(format!("http://{address}"), String::new()).unwrap();
+        let backend = WebBackend::new(format!("http://{address}"), String::new(), None).unwrap();
         backend.auth.lock().await.checked = true;
         let mut connection = new_connection_config(
             "web-timeout".to_string(),
@@ -2579,9 +2579,17 @@ mod tests {
 
         // The mock is a loopback server, so it must not inherit a contributor's
         // outbound proxy configuration.
-        let backend =
-            WebBackend::new_with_config(format!("http://{address}"), String::new(), None, None, None, false, None)
-                .unwrap();
+        let backend = WebBackend::new_with_config(
+            format!("http://{address}"),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         backend.auth.lock().await.checked = true;
         let connection = new_connection_config(
             "web-batch".to_string(),
