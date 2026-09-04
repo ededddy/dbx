@@ -2063,6 +2063,16 @@ impl Storage {
         Ok(settings.get("password_hash").and_then(|v| v.as_str()).map(|s| s.to_string()))
     }
 
+    /// Drops the legacy single-password hash once a row in the `users` table
+    /// gates web login, so the superseded credential is not kept around.
+    pub async fn clear_password_hash(&self) -> Result<(), String> {
+        let mut settings = self.load_app_settings_json().await?;
+        if settings.remove("password_hash").is_some() {
+            self.save_app_settings_json(&settings).await?;
+        }
+        Ok(())
+    }
+
     // Web user accounts (only used by dbx-web; the desktop app never reads this table)
 
     pub async fn list_users(&self) -> Result<Vec<UserRecord>, String> {
@@ -5304,8 +5314,8 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        maybe_import_user_data_db, DataDbImportResult, DeleteUserResult, DesktopIconTheme, DesktopSettings, McpGlobalPolicy,
-        McpGlobalPolicyState, Storage, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION, MCP_GLOBAL_POLICY_KEY,
+        maybe_import_user_data_db, DataDbImportResult, DeleteUserResult, DesktopIconTheme, DesktopSettings,
+        McpGlobalPolicy, McpGlobalPolicyState, Storage, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION, MCP_GLOBAL_POLICY_KEY,
     };
     use crate::ai::{
         AiActiveModelSelection, AiAssistantMode, AiChatMessage, AiChatSelectionState, AiConversation,
@@ -7362,6 +7372,24 @@ mod tests {
             vec!["conn-1".to_string(), "conn-1:db:main".to_string()]
         );
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn clear_password_hash_drops_only_the_legacy_hash() {
+        let path = temp_db_path("password-hash-clear");
+        let storage = Storage::open(&path).await.unwrap();
+
+        // Absent hash: clearing is a no-op.
+        storage.clear_password_hash().await.unwrap();
+        assert_eq!(storage.load_password_hash().await.unwrap(), None);
+
+        storage.save_password_hash("hash-5").await.unwrap();
+        storage.save_pinned_tree_node_ids(&["conn-1".to_string()]).await.unwrap();
+
+        storage.clear_password_hash().await.unwrap();
+
+        assert_eq!(storage.load_password_hash().await.unwrap(), None);
+        assert_eq!(storage.load_pinned_tree_node_ids().await.unwrap(), vec!["conn-1".to_string()]);
     }
 
     #[tokio::test]
